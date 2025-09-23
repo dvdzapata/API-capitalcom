@@ -11,13 +11,13 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 
 def load_env_file(path: Path) -> Dict[str, str]:
@@ -167,15 +167,7 @@ class RateLimiter:
 
 def create_retry_session() -> requests.Session:
     session = requests.Session()
-    retry = Retry(
-        total=5,
-        read=5,
-        connect=5,
-        backoff_factor=1.5,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET", "POST"),
-    )
-    adapter = HTTPAdapter(max_retries=retry)
+    adapter = HTTPAdapter(max_retries=0)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -489,6 +481,8 @@ class DatabaseWriter:
 
 
 class DataProvider:
+    MAX_ATTEMPTS = 3
+
     def __init__(self, session: requests.Session, rate_limiter: RateLimiter) -> None:
         self.session = session
         self.rate_limiter = rate_limiter
@@ -497,11 +491,84 @@ class DataProvider:
     def fetch(self, identifier: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
-    @staticmethod
-    def _safe_request(session: requests.Session, method: str, url: str, **kwargs: Any) -> requests.Response:
-        response = session.request(method, url, timeout=kwargs.pop("timeout", 60), **kwargs)
-        response.raise_for_status()
-        return response
+    def _compute_retry_wait(
+        self, response: Optional[requests.Response], attempt: int
+    ) -> float:
+        base_wait = max(self.rate_limiter.min_interval, 1.0) * attempt
+        retry_after = 0.0
+        if response is not None:
+            header = response.headers.get("Retry-After")
+            if header:
+                try:
+                    retry_after = float(header)
+                except ValueError:
+                    try:
+                        retry_dt = parsedate_to_datetime(header)
+                        if retry_dt.tzinfo is None:
+                            retry_dt = retry_dt.replace(tzinfo=timezone.utc)
+                        now = datetime.now(timezone.utc)
+                        retry_after = max(0.0, (retry_dt - now).total_seconds())
+                    except (TypeError, ValueError, OverflowError):
+                        retry_after = 0.0
+        wait_seconds = max(base_wait, retry_after)
+        return min(wait_seconds, 120.0)
+
+    def _safe_request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        timeout = kwargs.pop("timeout", 60)
+        request_kwargs = dict(kwargs)
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            self.rate_limiter.wait()
+            try:
+                response = self.session.request(
+                    method, url, timeout=timeout, **request_kwargs
+                )
+                response.raise_for_status()
+                return response
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response else None
+                retryable = status in {429, 500, 502, 503, 504}
+                if not retryable:
+                    self.logger.error(
+                        "Solicitud %s falló con estado %s: %s", url, status, exc
+                    )
+                    raise
+                last_error = exc
+                if attempt == self.MAX_ATTEMPTS:
+                    break
+                wait_seconds = self._compute_retry_wait(exc.response, attempt)
+                self.logger.warning(
+                    "HTTP %s en %s (intento %d/%d). Reintentando en %.1fs",
+                    status,
+                    url,
+                    attempt,
+                    self.MAX_ATTEMPTS,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt == self.MAX_ATTEMPTS:
+                    break
+                wait_seconds = self._compute_retry_wait(None, attempt)
+                self.logger.warning(
+                    "Error de red en %s (intento %d/%d): %s. Reintentando en %.1fs",
+                    url,
+                    attempt,
+                    self.MAX_ATTEMPTS,
+                    exc,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
+        if last_error is None:
+            last_error = RuntimeError(f"Fallo desconocido al solicitar {url}")
+        self.logger.error(
+            "Fallo definitivo solicitando %s tras %d intentos: %s",
+            url,
+            self.MAX_ATTEMPTS,
+            last_error,
+        )
+        raise last_error
 
 
 class FREDProvider(DataProvider):
@@ -520,8 +587,7 @@ class FREDProvider(DataProvider):
         }
         if self.api_key:
             params["api_key"] = self.api_key
-        self.rate_limiter.wait()
-        response = self._safe_request(self.session, "GET", self.BASE_URL, params=params)
+        response = self._safe_request("GET", self.BASE_URL, params=params)
         payload = response.json()
         if "observations" not in payload:
             raise ValueError(f"Unexpected response for FRED series {identifier}")
@@ -568,8 +634,7 @@ class CensusProvider(DataProvider):
         start_year = start_date[:4]
         params.setdefault("time", f"from+{start_year}")
         url = f"{self.BASE_URL}/{path}"
-        self.rate_limiter.wait()
-        response = self._safe_request(self.session, "GET", url, params=params)
+        response = self._safe_request("GET", url, params=params)
         payload = response.json()
         if not payload or not isinstance(payload, list) or len(payload) < 2:
             raise ValueError(f"Unexpected Census response for {identifier}")
@@ -600,8 +665,7 @@ class BLSProvider(DataProvider):
         }
         if self.api_key:
             payload["registrationkey"] = self.api_key
-        self.rate_limiter.wait()
-        response = self._safe_request(self.session, "POST", self.BASE_URL, json=payload)
+        response = self._safe_request("POST", self.BASE_URL, json=payload)
         payload_json = response.json()
         if payload_json.get("status") != "REQUEST_SUCCEEDED":
             raise ValueError(f"BLS request failed for {identifier}: {payload_json.get('message')}")
@@ -671,8 +735,7 @@ class EurostatProvider(DataProvider):
         dataset, params = self._split_identifier(identifier)
         params.setdefault("time", f">={start_date[:4]}")
         url = f"{self.BASE_URL}/{dataset}"
-        self.rate_limiter.wait()
-        response = self._safe_request(self.session, "GET", url, params=params)
+        response = self._safe_request("GET", url, params=params)
         payload = response.json()
         value_map = payload.get("value", {})
         dimensions = payload.get("dimension", {})
@@ -724,8 +787,7 @@ class ECBProvider(DataProvider):
             "format": "sdmx-json",
         }
         url = f"{self.BASE_URL}/{dataset}/{series}"
-        self.rate_limiter.wait()
-        response = self._safe_request(self.session, "GET", url, params=params)
+        response = self._safe_request("GET", url, params=params)
         payload = response.json()
         return self._parse_sdmx_json(payload)
 
@@ -822,8 +884,7 @@ class IMFProvider(DataProvider):
             "endPeriod": end_date,
         }
         url = f"{self.BASE_URL}/{dataset}/{series}"
-        self.rate_limiter.wait()
-        response = self._safe_request(self.session, "GET", url, params=params)
+        response = self._safe_request("GET", url, params=params)
         payload = response.json()
         return self._parse_compact(payload)
 
@@ -899,8 +960,7 @@ class BEAProvider(DataProvider):
             "Year",
             ",".join(str(year) for year in range(start_year, end_year + 1)),
         )
-        self.rate_limiter.wait()
-        response = self._safe_request(self.session, "GET", self.BASE_URL, params=params)
+        response = self._safe_request("GET", self.BASE_URL, params=params)
         payload = response.json()
         results = payload.get("BEAAPI", {}).get("Results", {})
         data = results.get("Data") or results.get("Series")
@@ -924,6 +984,10 @@ class SeriesConfig:
     identifier: str
     table: str
     column: str
+
+    @property
+    def source(self) -> str:
+        return self.api.lower()
 
 
 def parse_config_file(path: Path) -> List[SeriesConfig]:
@@ -1020,7 +1084,11 @@ class DataIngestor:
                 json.dumps(record, ensure_ascii=False)[:200],
             )
             return None
-        row: Dict[str, Any] = {"date": normalized_date}
+        row: Dict[str, Any] = {
+            "source": config.source,
+            "identifier": config.identifier,
+            "date": normalized_date,
+        }
         row[config.column] = record.get("value")
         return row
 

@@ -400,41 +400,89 @@ class DatabaseWriter:
         self.connection.commit()
         cursor.close()
 
+    def _build_upsert_sql(
+        self, table: str, columns: Sequence[str], pk_columns: Sequence[str]
+    ) -> str:
+        if not pk_columns:
+            raise ValueError(f"Table {table} does not define a primary key")
+        placeholders = ", ".join([self.placeholder] * len(columns))
+        columns_sql = ", ".join(f'"{col}"' for col in columns)
+        conflict_target = ", ".join(f'"{col}"' for col in pk_columns)
+        non_pk_columns = [col for col in columns if col not in pk_columns]
+        if non_pk_columns:
+            update_clause = ", ".join(
+                f'"{col}" = excluded."{col}"' for col in non_pk_columns
+            )
+            conflict_action = f"DO UPDATE SET {update_clause}"
+        else:
+            conflict_action = "DO NOTHING"
+        return (
+            f'INSERT INTO "{table}" ({columns_sql}) VALUES ({placeholders}) '
+            f"ON CONFLICT ({conflict_target}) {conflict_action}"
+        )
+
     def store_records(self, table: str, records: List[Dict[str, Any]]) -> None:
         if not records:
             return
         with self.lock:
+            schema = self._load_schema(table)
             column_map = self._ensure_schema(table, records)
-            ordered_keys = list(column_map.keys())
-            column_names = [column_map[key] for key in ordered_keys]
-            placeholders = ", ".join([self.placeholder] * len(column_names))
-            insert_sql: str
-            if self.dialect == "sqlite":
-                insert_sql = (
-                    f'INSERT OR REPLACE INTO "{table}" ({", ".join(f'"{col}"' for col in column_names)}) '
-                    f'VALUES ({placeholders})'
-                )
-            else:
-                pk = self._load_schema(table)["primary_key"]
-                update_clause = ", ".join(
-                    f'"{col}" = EXCLUDED."{col}"' for col in column_names
-                )
-                insert_sql = (
-                    f'INSERT INTO "{table}" ({", ".join(f'"{col}"' for col in column_names)}) '
-                    f'VALUES ({placeholders}) '
-                    f'ON CONFLICT ({", ".join(f'"{col}"' for col in pk)}) DO UPDATE SET {update_clause}'
-                )
+            pk_columns = schema.get("primary_key", [])
+            column_order = [column_map[key] for key in column_map.keys()]
+            reverse_map = {v: k for k, v in column_map.items()}
+
+            statement_cache: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+
+            for record in records:
+                sanitized_record: Dict[str, Any] = {}
+                for original, sanitized in column_map.items():
+                    if original in record:
+                        sanitized_record[sanitized] = record[original]
+
+                if not sanitized_record:
+                    continue
+
+                missing_pk = [pk for pk in pk_columns if pk not in sanitized_record]
+                for pk in missing_pk:
+                    original_key = reverse_map.get(pk)
+                    if original_key and original_key in record:
+                        sanitized_record[pk] = record[original_key]
+                missing_pk = [pk for pk in pk_columns if pk not in sanitized_record]
+                if missing_pk:
+                    logging.warning(
+                        "Omitiendo registro en %s: faltan columnas de clave primaria %s",
+                        table,
+                        ", ".join(missing_pk),
+                    )
+                    continue
+
+                columns = [col for col in column_order if col in sanitized_record]
+                if not columns or all(col in pk_columns for col in columns):
+                    continue
+
+                key = tuple(columns)
+                if key not in statement_cache:
+                    statement_cache[key] = {
+                        "sql": self._build_upsert_sql(table, columns, pk_columns),
+                        "columns": columns,
+                        "rows": [],
+                    }
+
+                row_values = []
+                for column in columns:
+                    value = sanitized_record.get(column)
+                    row_values.append(value if value is None else str(value))
+                statement_cache[key]["rows"].append(tuple(row_values))
+
+            if not statement_cache:
+                return
 
             cursor = self.connection.cursor()
-            rows = []
-            for record in records:
-                row = []
-                for key in ordered_keys:
-                    value = record.get(key)
-                    row.append(value if value is None else str(value))
-                rows.append(tuple(row))
             try:
-                cursor.executemany(insert_sql, rows)
+                for entry in statement_cache.values():
+                    if not entry["rows"]:
+                        continue
+                    cursor.executemany(entry["sql"], entry["rows"])
                 self.connection.commit()
             finally:
                 cursor.close()
@@ -875,6 +923,7 @@ class SeriesConfig:
     api: str
     identifier: str
     table: str
+    column: str
 
 
 def parse_config_file(path: Path) -> List[SeriesConfig]:
@@ -889,12 +938,22 @@ def parse_config_file(path: Path) -> List[SeriesConfig]:
             logging.warning("Skipping invalid config line: %s", raw_line)
             continue
         api_name, remainder = line.split("=", 1)
-        identifier, table = remainder.rsplit(",", 1)
+        parts = [part.strip() for part in remainder.split(",")]
+        if len(parts) < 3:
+            logging.warning("Skipping invalid config line (expected API=IDENTIFIER,TABLE,COLUMN): %s", raw_line)
+            continue
+        table = parts[-2]
+        column = parts[-1]
+        identifier = ",".join(parts[:-2]).strip()
+        if not identifier or not table or not column:
+            logging.warning("Skipping config line with empty fields: %s", raw_line)
+            continue
         configs.append(
             SeriesConfig(
                 api=api_name.strip().upper(),
                 identifier=identifier.strip(),
                 table=table.strip(),
+                column=column.strip(),
             )
         )
     return configs
@@ -937,11 +996,33 @@ class DataIngestor:
             if not provider:
                 logging.error("No provider available for API %s", config.api)
                 continue
-            logging.info("Procesando %s -> %s", config.identifier, config.table)
+            logging.info(
+                "Procesando %s (%s) -> %s.%s",
+                config.identifier,
+                config.api,
+                config.table,
+                config.column,
+            )
             try:
                 self._process_series(provider, config)
             except Exception as exc:  # pragma: no cover
                 logging.exception("Error processing %s (%s): %s", config.identifier, config.api, exc)
+
+    @staticmethod
+    def _record_to_table_row(record: Dict[str, Any], config: SeriesConfig) -> Optional[Dict[str, Any]]:
+        raw_date = record.get("date")
+        normalized_date = normalize_date_string(raw_date) if raw_date else None
+        if not normalized_date:
+            logging.warning(
+                "Registro sin fecha válido para %s (%s): %s",
+                config.identifier,
+                config.api,
+                json.dumps(record, ensure_ascii=False)[:200],
+            )
+            return None
+        row: Dict[str, Any] = {"date": normalized_date}
+        row[config.column] = record.get("value")
+        return row
 
     def _process_series(self, provider: DataProvider, config: SeriesConfig) -> None:
         cache_entry = self.cache_manager.load(config.api, config.identifier)
@@ -961,19 +1042,40 @@ class DataIngestor:
                 existing_records.append(record)
                 new_records.append(record)
         if new_records:
-            self.db_writer.store_records(config.table, new_records)
+            storage_ready: List[Dict[str, Any]] = []
+            skipped_records = 0
+            for record in new_records:
+                table_row = self._record_to_table_row(record, config)
+                if table_row is None:
+                    skipped_records += 1
+                    continue
+                storage_ready.append(table_row)
+            if storage_ready:
+                self.db_writer.store_records(config.table, storage_ready)
+            if skipped_records:
+                logging.warning(
+                    "%s: %d registros nuevos ignorados por fecha inválida",
+                    config.identifier,
+                    skipped_records,
+                )
             existing_records.sort(key=lambda record: record.get("date") or "")
             last_date = self._compute_last_date(existing_records)
             cache_payload = {
                 "api": config.api,
                 "identifier": config.identifier,
                 "table": config.table,
+                "column": config.column,
                 "last_date": last_date,
                 "records": existing_records,
                 "updated_at": datetime.utcnow().isoformat(),
             }
             self.cache_manager.save(config.api, config.identifier, cache_payload)
-            logging.info("%s: %d registros nuevos", config.identifier, len(new_records))
+            logging.info(
+                "%s: %d registros nuevos, %d almacenados",
+                config.identifier,
+                len(new_records),
+                len(storage_ready),
+            )
         else:
             logging.info("%s: sin novedades", config.identifier)
 

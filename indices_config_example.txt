@@ -1,0 +1,13 @@
+# Ejemplo de archivo de configuración para integrated_data_ingestor.py
+# Formato: API=IDENTIFICADOR,TABLA_DESTINO,COLUMNA_DESTINO
+# Quite el prefijo "#" y adapte según sus necesidades.
+
+FRED=NASDAQGSOXNR,features_semiconductores,nasdaq_global_semi_ntr
+FRED=NASDAQGSOXTR,features_semiconductores,nasdaq_global_semi_tr
+FRED=NASDAQGSOX,features_semiconductores,nasdaq_global_semi_idx
+CENSUS=timeseries/eits/resconst?get=cell_value,data_type_code&time=from+2020,construccion_censo,permisos_total
+BLS=CES0000000001,empleo_bls,empleo_total
+EUROSTAT=prc_hicp_midx?geo=U2&coicop=CP00&unit=I15,ipc_eurozona,ipc_general
+ECB=EXR/D.USD.EUR.SP00.A,tipos_cambio_ecb,usd_por_eur
+IMF=IFS/A.US.PMP_IX,precios_imf,indice_precios
+BEA=DataSetName=NIPA&TableName=T10101&LineNumber=1&Frequency=Q,bea_pib,pib_real

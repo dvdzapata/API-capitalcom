@@ -833,6 +833,7 @@ class DataCompletenessAuditor:
         self.yf_client = yf_client
         self.logger = logging.getLogger("DataCompletenessAuditor")
         self.asset_metadata: Dict[Any, Dict[str, Any]] = {}
+        self._normalize_cache: Dict[str, Dict[Any, Optional[pd.Timestamp]]] = {}
         if cfg.asset_lookup_query:
             try:
                 self.asset_metadata = db.fetch_asset_metadata(cfg.asset_lookup_query)
@@ -841,6 +842,19 @@ class DataCompletenessAuditor:
 
     def _table_timezone(self, cfg: TimeseriesTableConfig) -> str:
         return cfg.timezone or self.cfg.timezone or "UTC"
+
+    @staticmethod
+    def _tz_identifier(tzinfo: Optional[dt.tzinfo]) -> Optional[str]:
+        if tzinfo is None:
+            return None
+        for attr in ("key", "zone"):
+            val = getattr(tzinfo, attr, None)
+            if val:
+                return str(val)
+        name = tzinfo.tzname(None)
+        if name:
+            return name
+        return str(tzinfo)
 
     def _parse_timestamp(self, cfg: TimeseriesTableConfig, value: Any) -> Optional[pd.Timestamp]:
         try:
@@ -856,7 +870,9 @@ class DataCompletenessAuditor:
                 if ts.tzinfo is None:
                     ts = ts.tz_localize(tz_name)
                 else:
-                    ts = ts.tz_convert(tz_name)
+                    current_tz = self._tz_identifier(ts.tzinfo)
+                    if current_tz != tz_name:
+                        ts = ts.tz_convert(tz_name)
             except Exception:
                 self.logger.debug(
                     "Fallo al ajustar zona horaria %s para %s en %s", tz_name, value, cfg.table,
@@ -1315,10 +1331,32 @@ class DataCompletenessAuditor:
         return actions
 
     def _normalize_for_cfg(self, cfg: TimeseriesTableConfig, ts: Any) -> Optional[pd.Timestamp]:
+        cache = self._normalize_cache.setdefault(cfg.table, {})
+
+        def _cache_key(value: Any) -> Any:
+            if isinstance(value, pd.Timestamp):
+                return (value.value, self._tz_identifier(value.tzinfo))
+            if isinstance(value, dt.datetime):
+                ts_val = pd.Timestamp(value)
+                return (ts_val.value, self._tz_identifier(ts_val.tzinfo))
+            return value
+
+        key = _cache_key(ts)
+        if key in cache:
+            return cache[key]
+
         parsed = self._parse_timestamp(cfg, ts)
         if parsed is None:
+            cache[key] = None
             return None
-        return parsed.normalize() if cfg.frequency == "daily" else parsed
+
+        normalized = parsed.normalize() if cfg.frequency == "daily" else parsed
+        cache[key] = normalized
+
+        if len(cache) > 10000:
+            cache.clear()
+
+        return normalized
 
     def _attempt_derivations(
         self,

@@ -1,71 +1,28 @@
-"""Herramienta integral de auditoría y completitud de datos financieros.
+#!/usr/bin/env python3
+"""Auditoría y completitud de series temporales financieras.
 
-Este script inspecciona la base de datos PostgreSQL indicada en la configuración
-(.env), detecta elementos huérfanos en el esquema, analiza la completitud de las
-series temporales de cotizaciones y, cuando es posible, completa los huecos
-consultando las API de Capital.com (para datos CFD) y Financial Modeling Prep
-(FMP) o Yahoo Finance como respaldo. Todas las operaciones quedan registradas en
-tablas de auditoría con trazabilidad completa.
-
-Características principales
----------------------------
-* Carga de credenciales y parámetros desde un archivo .env.
-* Descubrimiento de tablas, vistas y claves foráneas para localizar restos de
-  borrados u orfandades.
-* Validación semántica de los campos financieros: precios coherentes, volúmenes
-  no negativos, alineación de máximos/mínimos, etc.
-* Detección de huecos (NULL, NaN, 0 sospechoso, strings vacíos, placeholders) y
-  fechas faltantes por activo.
-* Recuperación automática de datos faltantes usando Capital.com o FMP/YFinance,
-  respetando límites de reintentos y marcando flags persistentes cuando no se
-  logra completar la información tras tres intentos.
-* Registro de auditoría con hash de configuración y resumen de acciones
-  ejecutadas.
-* Informes en JSON y en texto de los hallazgos.
-
-Requisitos
-----------
-Dependencias sugeridas (instalarlas vía pip):
-
-```
-pip install python-dotenv psycopg2-binary pandas requests tqdm yfinance
-```
-
-La librería `yfinance` es opcional; si no está instalada, el script continúa sin
-la fuente de respaldo.
-
-Uso
-----
-
-1. Crear un archivo `.env` en el mismo directorio con las variables necesarias.
-   Ver `AppConfig.from_env` para el detalle completo.
-2. Ejecutar el script:
-
-```
-python script_completitud.py
-```
-
-Opcionalmente se pueden indicar parámetros adicionales mediante argumentos de
-línea de comandos (`--reanalizar` para forzar reanálisis final, `--max-activos`
-para limitar el número de activos auditados, etc.).
+El script conecta con PostgreSQL, detecta elementos huérfanos, analiza las
+series configuradas y rellena huecos derivados de forma local o consultando
+Capital.com, Financial Modeling Prep o Yahoo Finance. Registra todas las
+acciones en archivos JSON versionados y muestra un resumen en consola.
 """
 
 from __future__ import annotations
 
 import argparse
-import ast
 import datetime as dt
 import json
 import logging
 import math
 import os
 import sys
-import time
+from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import psycopg2
@@ -93,8 +50,7 @@ PLACEHOLDER_VALUES = {
     "pending",
 }
 
-
-NUMERIC_COLUMNS = {
+NUMERIC_FIELDS = {
     "open",
     "high",
     "low",
@@ -114,22 +70,20 @@ NUMERIC_COLUMNS = {
     "spread_close",
 }
 
-INTEGER_COLUMNS = {
-    "ts_epoch",
-}
+INTEGER_FIELDS = {"ts_epoch"}
 
-CAPITAL_FIELD_MAP = {
-    "open": "openPrice",
-    "high": "highPrice",
-    "low": "lowPrice",
-    "close": "closePrice",
-    "volume": "lastTradedVolume",
-    "spread_open": "openPrice.spread",
-    "spread_close": "closePrice.spread",
+CAPITAL_DEFAULT_FIELD_MAP = {
     "open_bid": "openPrice.bid",
     "open_ask": "openPrice.ask",
     "close_bid": "closePrice.bid",
     "close_ask": "closePrice.ask",
+    "open": "openPrice.mid",
+    "high": "highPrice.mid",
+    "low": "lowPrice.mid",
+    "close": "closePrice.mid",
+    "volume": "lastTradedVolume",
+    "spread_open": "openPrice.spread",
+    "spread_close": "closePrice.spread",
 }
 
 FMP_DAILY_FIELD_MAP = {
@@ -138,10 +92,10 @@ FMP_DAILY_FIELD_MAP = {
     "low": "low",
     "close": "close",
     "volume": "volume",
+    "divadj_close": "adjClose",
     "divadj_open": "adjOpen",
     "divadj_high": "adjHigh",
     "divadj_low": "adjLow",
-    "divadj_close": "adjClose",
     "change": "change",
     "change_percent": "changePercent",
 }
@@ -154,7 +108,7 @@ FMP_INTRADAY_FIELD_MAP = {
     "volume": "volume",
 }
 
-YF_FIELD_MAP = {
+YFINANCE_FIELD_MAP = {
     "open": "Open",
     "high": "High",
     "low": "Low",
@@ -162,425 +116,182 @@ YF_FIELD_MAP = {
     "volume": "Volume",
 }
 
-PROVIDER_LABELS = {
-    "capital": "Capital.com",
-    "fmp": "Financial Modeling Prep",
-    "yfinance": "Yahoo Finance",
-}
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "si", "sí"}
-
-
-def _json_env(name: str) -> Optional[Any]:
-    raw = os.getenv(name)
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        logger = logging.getLogger(__name__)
-        try:
-            return ast.literal_eval(raw)
-        except (ValueError, SyntaxError):
-            logger.warning("No se pudo parsear %s como JSON", name)
-            return None
+DEFAULT_TABLES = [
+    {
+        "table": "cotizaciones_diarias_cfd",
+        "asset_column": "asset_id",
+        "datetime_column": "fecha",
+        "provider": "capital",
+        "frequency": "daily",
+        "timezone": "Europe/Madrid",
+        "field_map": CAPITAL_DEFAULT_FIELD_MAP,
+    },
+    {
+        "table": "cotizaciones_intradia_cfd",
+        "asset_column": "asset_id",
+        "datetime_column": "timestamp",
+        "provider": "capital",
+        "frequency": "intraday",
+        "interval_minutes": 5,
+        "timezone": "Europe/Madrid",
+        "field_map": CAPITAL_DEFAULT_FIELD_MAP,
+    },
+    {
+        "table": "cotizaciones_diarias",
+        "asset_column": "asset_id",
+        "datetime_column": "fecha",
+        "provider": "fmp",
+        "frequency": "daily",
+        "timezone": "UTC",
+        "field_map": FMP_DAILY_FIELD_MAP,
+    },
+    {
+        "table": "cotizaciones_intradia",
+        "asset_column": "asset_id",
+        "datetime_column": "timestamp",
+        "provider": "fmp",
+        "frequency": "intraday",
+        "interval_minutes": 5,
+        "timezone": "UTC",
+        "field_map": FMP_INTRADAY_FIELD_MAP,
+    },
+]
 
 
 @dataclass
-class TimeseriesTableConfig:
-    """Configuración de una tabla de series temporales a auditar."""
-
+class TableConfig:
     table: str
     asset_column: str
     datetime_column: str
-    data_columns: List[str]
-    frequency: str = "daily"  # daily | intraday
-    interval_minutes: Optional[int] = None
+    provider: str
+    frequency: str
+    fields: List[str] = field(default_factory=list)
     timezone: str = "UTC"
-    allow_weekends: bool = False
-    conflict_columns: Sequence[str] = field(default_factory=list)
+    interval_minutes: Optional[int] = None
+    skip_weekends: bool = True
     symbol_column: Optional[str] = None
-    price_floor: Optional[float] = None
-    price_ceiling: Optional[float] = None
-    provider: Optional[str] = None
-    endpoint_templates: Dict[str, str] = field(default_factory=dict)
-    field_mappings: Dict[str, Dict[str, str]] = field(default_factory=dict)
-    enabled: bool = True
+    endpoint: Optional[str] = None
+    request_limit: int = 250
+    field_map: Dict[str, str] = field(default_factory=dict)
 
-    def expected_timedelta(self) -> Optional[pd.Timedelta]:
-        if self.frequency == "daily":
-            return pd.Timedelta(days=1)
-        if self.frequency == "intraday" and self.interval_minutes:
-            return pd.Timedelta(minutes=self.interval_minutes)
-        return None
+    @staticmethod
+    def from_dict(raw: Dict[str, Any]) -> "TableConfig":
+        return TableConfig(
+            table=raw["table"],
+            asset_column=raw.get("asset_column", "asset_id"),
+            datetime_column=raw.get("datetime_column", "fecha"),
+            provider=raw.get("provider", "capital"),
+            frequency=raw.get("frequency", "daily"),
+            fields=list(raw.get("fields", [])),
+            timezone=raw.get("timezone", "UTC"),
+            interval_minutes=raw.get("interval_minutes"),
+            skip_weekends=raw.get("skip_weekends", True),
+            symbol_column=raw.get("symbol_column"),
+            endpoint=raw.get("endpoint"),
+            request_limit=int(raw.get("request_limit", 250)),
+            field_map=raw.get("field_map", {}),
+        )
 
 
 @dataclass
 class AppConfig:
-    """Parámetros globales cargados desde .env."""
-
-    pg_dsn: str
+    db_host: str
+    db_port: int
+    db_name: str
+    db_user: str
+    db_password: str
+    schema: str
+    asset_table: str
+    asset_id_column: str
+    asset_symbol_column: str
+    output_dir: Path
+    logs_dir: Path
+    timeseries_tables: List[TableConfig]
     capital_api_key: Optional[str]
-    capital_email: Optional[str]
-    capital_password: Optional[str]
+    capital_api_url: Optional[str]
     fmp_api_key: Optional[str]
-    max_requests_per_minute: int = 20
-    request_timeout: int = 30
-    request_retries: int = 3
-    tables: List[TimeseriesTableConfig] = field(default_factory=list)
-    reports_dir: Path = Path("reports")
-    logs_dir: Path = Path("logs")
-    enable_refill: bool = True
-    asset_lookup_query: Optional[str] = None
-    audit_table: str = "data_completeness_audit"
-    flags_table: str = "data_completeness_flags"
-    chunk_size: int = 5000
-    max_assets: Optional[int] = None
-    timezone: str = "UTC"
-    reanalyse_after_fill: bool = True
+    fmp_api_url: str
+    yfinance_enabled: bool
+    max_refill_attempts: int
 
     @staticmethod
-    def _default_tables() -> List[TimeseriesTableConfig]:
-        return [
-            TimeseriesTableConfig(
-                table="cotizaciones_diarias_cfd",
-                asset_column="asset_id",
-                datetime_column="fecha",
-                data_columns=["open", "high", "low", "close", "volume"],
-                frequency="daily",
-                conflict_columns=["asset_id", "fecha"],
-                provider="capital",
-                endpoint_templates={"default": "/prices/{epic}"},
-                field_mappings={"capital": dict(CAPITAL_FIELD_MAP)},
-            ),
-            TimeseriesTableConfig(
-                table="cotizaciones_intradia_cfd",
-                asset_column="asset_id",
-                datetime_column="timestamp",
-                data_columns=["open", "high", "low", "close", "volume"],
-                frequency="intraday",
-                interval_minutes=1,
-                conflict_columns=["asset_id", "timestamp"],
-                provider="capital",
-                endpoint_templates={"default": "/prices/{epic}"},
-                field_mappings={"capital": dict(CAPITAL_FIELD_MAP)},
-            ),
-            TimeseriesTableConfig(
-                table="cotizaciones_diarias",
-                asset_column="asset_id",
-                datetime_column="fecha",
-                data_columns=["open", "high", "low", "close", "volume"],
-                frequency="daily",
-                conflict_columns=["asset_id", "fecha"],
-                provider="fmp",
-                endpoint_templates={
-                    "daily": "/historical-price-full/{symbol}",
-                    "intraday": "/historical-chart/{interval}min/{symbol}",
-                },
-                field_mappings={
-                    "daily": dict(FMP_DAILY_FIELD_MAP),
-                    "intraday": dict(FMP_INTRADAY_FIELD_MAP),
-                },
-            ),
-            TimeseriesTableConfig(
-                table="cotizaciones_intradia",
-                asset_column="asset_id",
-                datetime_column="timestamp",
-                data_columns=["open", "high", "low", "close", "volume"],
-                frequency="intraday",
-                interval_minutes=1,
-                conflict_columns=["asset_id", "timestamp"],
-                provider="fmp",
-                endpoint_templates={
-                    "daily": "/historical-price-full/{symbol}",
-                    "intraday": "/historical-chart/{interval}min/{symbol}",
-                },
-                field_mappings={
-                    "daily": dict(FMP_DAILY_FIELD_MAP),
-                    "intraday": dict(FMP_INTRADAY_FIELD_MAP),
-                },
-            ),
-        ]
+    def from_env(env_path: Optional[Path] = None) -> "AppConfig":
+        if env_path is None:
+            env_path = Path(".env")
+        if env_path.exists():
+            load_dotenv(env_path)
 
-    @classmethod
-    def from_env(cls) -> "AppConfig":
-        load_dotenv()
-
-        pg_dsn = os.getenv("PG_DSN")
-        if not pg_dsn:
-            host = os.getenv("PG_HOST", "localhost")
-            port = os.getenv("PG_PORT", "5432")
-            user = os.getenv("PG_USER", "postgres")
-            password = os.getenv("PG_PASSWORD", "")
-            database = os.getenv("PG_DATABASE", "postgres")
-            pg_dsn = f"host={host} port={port} user={user} password={password} dbname={database}"
-
-        tables = cls._default_tables()
-        override = _json_env("TIMESERIES_TABLES_JSON")
-        if override:
-            tables = []
-            for item in override:
-                tables.append(
-                    TimeseriesTableConfig(
-                        table=item["table"],
-                        asset_column=item.get("asset_column", "asset_id"),
-                        datetime_column=item.get("datetime_column", "fecha"),
-                        data_columns=item.get("data_columns", ["open", "high", "low", "close", "volume"]),
-                        frequency=item.get("frequency", "daily"),
-                        interval_minutes=item.get("interval_minutes"),
-                        timezone=item.get("timezone", "UTC"),
-                        allow_weekends=item.get("allow_weekends", False),
-                        conflict_columns=item.get("conflict_columns", [item.get("asset_column", "asset_id"), item.get("datetime_column", "fecha")]),
-                        symbol_column=item.get("symbol_column"),
-                        price_floor=item.get("price_floor"),
-                        price_ceiling=item.get("price_ceiling"),
-                        provider=item.get("provider"),
-                        endpoint_templates=item.get("endpoint_templates", {}),
-                        field_mappings=item.get("field_mappings", {}),
-                        enabled=item.get("enabled", True),
-                    )
+        tables_raw: List[Dict[str, Any]]
+        tables_str = os.getenv("TIMESERIES_TABLES_JSON")
+        if tables_str:
+            try:
+                tables_raw = json.loads(tables_str)
+            except json.JSONDecodeError as exc:
+                logging.getLogger("completitud").warning(
+                    "No se pudo parsear TIMESERIES_TABLES_JSON: %s", exc
                 )
+                tables_raw = DEFAULT_TABLES
+        else:
+            tables_raw = DEFAULT_TABLES
 
-        return cls(
-            pg_dsn=pg_dsn,
+        timeseries_tables = [TableConfig.from_dict(t) for t in tables_raw]
+
+        output_dir = Path(os.getenv("OUTPUT_DIR", "salidas"))
+        logs_dir = Path(os.getenv("LOGS_DIR", "logs"))
+
+        return AppConfig(
+            db_host=os.getenv("PGHOST", "localhost"),
+            db_port=int(os.getenv("PGPORT", "5432")),
+            db_name=os.getenv("PGDATABASE", "capital"),
+            db_user=os.getenv("PGUSER", "postgres"),
+            db_password=os.getenv("PGPASSWORD", "postgres"),
+            schema=os.getenv("PGSCHEMA", "public"),
+            asset_table=os.getenv("ASSET_TABLE", "activos"),
+            asset_id_column=os.getenv("ASSET_ID_COLUMN", "id"),
+            asset_symbol_column=os.getenv("ASSET_SYMBOL_COLUMN", "simbolo"),
+            output_dir=output_dir,
+            logs_dir=logs_dir,
+            timeseries_tables=timeseries_tables,
             capital_api_key=os.getenv("CAPITAL_API_KEY"),
-            capital_email=os.getenv("CAPITAL_EMAIL"),
-            capital_password=os.getenv("CAPITAL_PASSWORD"),
+            capital_api_url=os.getenv("CAPITAL_API_URL"),
             fmp_api_key=os.getenv("FMP_API_KEY"),
-            max_requests_per_minute=int(os.getenv("MAX_REQUESTS_PER_MIN", "20")),
-            request_timeout=int(os.getenv("REQUEST_TIMEOUT", "30")),
-            request_retries=int(os.getenv("REQUEST_RETRIES", "3")),
-            tables=tables,
-            reports_dir=Path(os.getenv("REPORTS_DIR", "reports")),
-            logs_dir=Path(os.getenv("LOGS_DIR", "logs")),
-            enable_refill=_env_bool("ENABLE_REFILL", True),
-            asset_lookup_query=os.getenv("ASSET_LOOKUP_QUERY"),
-            audit_table=os.getenv("AUDIT_TABLE", "data_completeness_audit"),
-            flags_table=os.getenv("FLAGS_TABLE", "data_completeness_flags"),
-            chunk_size=int(os.getenv("DB_CHUNK_SIZE", "5000")),
-            max_assets=int(os.getenv("MAX_ASSETS")) if os.getenv("MAX_ASSETS") else None,
-            timezone=os.getenv("DEFAULT_TIMEZONE", "UTC"),
-            reanalyse_after_fill=_env_bool("REANALYSE_AFTER_FILL", True),
+            fmp_api_url=os.getenv("FMP_API_URL", "https://financialmodelingprep.com/api/v3"),
+            yfinance_enabled=os.getenv("ENABLE_YFINANCE", "1") not in {"0", "false", "False"},
+            max_refill_attempts=int(os.getenv("MAX_REFILL_ATTEMPTS", "3")),
         )
+
 
 def setup_logging(cfg: AppConfig) -> None:
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
     log_file = cfg.logs_dir / f"completitud_{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d')}.log"
-    formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s - %(message)s", "%Y-%m-%d %H:%M:%S"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_file, encoding="utf-8"),
+        ],
     )
 
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(formatter)
-    file_handler.setLevel(logging.INFO)
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    console_handler.setLevel(logging.INFO)
-
-    logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
-
-class CapitalComClient:
-    BASE_URL = "https://api-capital.backend-capital.com/api/v1"
-
-    def __init__(self, cfg: AppConfig, logger: logging.Logger) -> None:
+class Database:
+    def __init__(self, cfg: AppConfig):
         self.cfg = cfg
-        self.logger = logger.getChild("CapitalCom")
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
-        if cfg.capital_api_key:
-            self.session.headers["X-CAP-API-KEY"] = cfg.capital_api_key
-        self.cst = None
-        self.xst = None
-        self.last_request = 0.0
-        self.login()
-
-    def login(self) -> None:
-        if not (self.cfg.capital_email and self.cfg.capital_password):
-            self.logger.warning("Credenciales de Capital.com incompletas. Se omiten peticiones.")
-            return
-
-        payload = {
-            "identifier": self.cfg.capital_email,
-            "password": self.cfg.capital_password,
-        }
-        resp = self.session.post(f"{self.BASE_URL}/session", json=payload, timeout=self.cfg.request_timeout)
-        if resp.status_code not in (200, 201):
-            raise RuntimeError(f"No fue posible autenticar en Capital.com: {resp.status_code} {resp.text}")
-
-        self.cst = resp.headers.get("CST")
-        self.xst = resp.headers.get("X-SECURITY-TOKEN") or resp.headers.get("X-SECURITY-TOKEN".lower())
-        if not self.cst or not self.xst:
-            try:
-                body = resp.json()
-            except Exception:  # pragma: no cover
-                body = {}
-            self.cst = self.cst or body.get("CST")
-            self.xst = self.xst or body.get("securityToken") or body.get("X-SECURITY-TOKEN")
-        if not self.cst or not self.xst:
-            raise RuntimeError("La autenticación de Capital.com no entregó tokens CST/XST")
-
-        self.session.headers.update({"CST": self.cst, "X-SECURITY-TOKEN": self.xst})
-        self.logger.info("Sesión Capital.com iniciada correctamente")
-
-    def _respect_rate_limit(self) -> None:
-        min_interval = 60.0 / max(self.cfg.max_requests_per_minute, 1)
-        elapsed = time.monotonic() - self.last_request
-        if elapsed < min_interval:
-            time.sleep(min_interval - elapsed)
-
-    def fetch_prices(
-        self,
-        epic: str,
-        start: dt.datetime,
-        end: dt.datetime,
-        resolution: str,
-    ) -> List[Dict[str, Any]]:
-        if not self.cst or not self.xst:
-            self.logger.debug("Sin tokens de sesión, no se solicitarán precios Capital.com")
-            return []
-
-        params = {
-            "resolution": resolution,
-            "from": start.strftime("%Y-%m-%dT%H:%M:%S"),
-            "to": end.strftime("%Y-%m-%dT%H:%M:%S"),
-            "pageSize": 2000,
-        }
-
-        path = f"{self.BASE_URL}/prices/{epic}"
-        records: List[Dict[str, Any]] = []
-        for attempt in range(self.cfg.request_retries):
-            try:
-                self._respect_rate_limit()
-                resp = self.session.get(path, params=params, timeout=self.cfg.request_timeout)
-                self.last_request = time.monotonic()
-                if resp.status_code != 200:
-                    raise RuntimeError(f"Capital.com status {resp.status_code}: {resp.text}")
-                data = resp.json()
-                prices = data.get("prices", [])
-                if isinstance(prices, list):
-                    records.extend([item for item in prices if isinstance(item, dict)])
-                break
-            except Exception as exc:  # pragma: no cover
-                self.logger.warning("Intento %s fallido al pedir precios Capital.com: %s", attempt + 1, exc)
-                time.sleep(2 * (attempt + 1))
-        return records
-
-class FMPClient:
-    BASE_URL = "https://financialmodelingprep.com/api/v3"
-
-    def __init__(self, cfg: AppConfig, logger: logging.Logger) -> None:
-        self.cfg = cfg
-        self.logger = logger.getChild("FMP")
-        self.session = requests.Session()
-        self.session.headers.update({"Accept": "application/json"})
-
-    def fetch_daily(self, symbol: str, start: dt.date, end: dt.date) -> List[Dict[str, Any]]:
-        if not self.cfg.fmp_api_key:
-            self.logger.warning("Sin API key de FMP, no se consultarán datos diarios")
-            return []
-        url = f"{self.BASE_URL}/historical-price-full/{symbol.upper()}"
-        params = {
-            "from": start.strftime("%Y-%m-%d"),
-            "to": end.strftime("%Y-%m-%d"),
-            "apikey": self.cfg.fmp_api_key,
-        }
-        try:
-            resp = self.session.get(url, params=params, timeout=self.cfg.request_timeout)
-            if resp.status_code != 200:
-                raise RuntimeError(f"FMP status {resp.status_code}: {resp.text}")
-            data = resp.json()
-        except Exception as exc:  # pragma: no cover
-            self.logger.warning("Error al consultar FMP diario para %s: %s", symbol, exc)
-            return []
-        items = data.get("historical") if isinstance(data, dict) else None
-        return [item for item in items or [] if isinstance(item, dict)]
-
-    def fetch_intraday(self, symbol: str, minutes: int, start: dt.datetime, end: dt.datetime) -> List[Dict[str, Any]]:
-        if not self.cfg.fmp_api_key:
-            self.logger.warning("Sin API key de FMP, no se consultarán datos intradía")
-            return []
-        interval = f"{minutes}min"
-        url = f"{self.BASE_URL}/historical-chart/{interval}/{symbol.upper()}"
-        params = {
-            "apikey": self.cfg.fmp_api_key,
-            "from": start.strftime("%Y-%m-%d"),
-            "to": end.strftime("%Y-%m-%d"),
-        }
-        try:
-            resp = self.session.get(url, params=params, timeout=self.cfg.request_timeout)
-            if resp.status_code != 200:
-                raise RuntimeError(f"FMP status {resp.status_code}: {resp.text}")
-            data = resp.json()
-        except Exception as exc:  # pragma: no cover
-            self.logger.warning("Error al consultar FMP intradía para %s: %s", symbol, exc)
-            return []
-        return [item for item in data if isinstance(item, dict)]
-
-class YahooFinanceClient:
-    def __init__(self, logger: logging.Logger) -> None:
-        self.logger = logger.getChild("YahooFinance")
-        if not HAS_YFINANCE:
-            self.logger.warning("yfinance no está instalado; no habrá respaldo de datos")
-
-    def fetch(self, symbol: str, start: dt.datetime, end: dt.datetime, interval: str) -> List[Dict[str, Any]]:
-        if not HAS_YFINANCE:
-            return []
-        try:
-            df = yf.download(  # type: ignore[attr-defined]
-                symbol,
-                start=start,
-                end=end + dt.timedelta(days=1),
-                interval=interval,
-                progress=False,
-                auto_adjust=False,
-            )
-        except Exception as exc:  # pragma: no cover
-            self.logger.warning("Yahoo Finance falló para %s: %s", symbol, exc)
-            return []
-        if df.empty:
-            return []
-        df = df.reset_index()
-        records: List[Dict[str, Any]] = []
-        for row in df.to_dict(orient="records"):
-            timestamp = row.get("Datetime") or row.get("Date")
-            if pd.isna(timestamp):
-                continue
-            records.append(
-                {
-                    "timestamp": pd.Timestamp(timestamp).to_pydatetime(),
-                    "open": float(row.get("Open", float("nan"))),
-                    "high": float(row.get("High", float("nan"))),
-                    "low": float(row.get("Low", float("nan"))),
-                    "close": float(row.get("Close", float("nan"))),
-                    "volume": float(row.get("Volume", float("nan"))),
-                }
-            )
-        return records
-
-class DatabaseManager:
-    def __init__(self, cfg: AppConfig, logger: logging.Logger) -> None:
-        self.cfg = cfg
-        self.logger = logger.getChild("DB")
-        self.conn = psycopg2.connect(cfg.pg_dsn)
+        self.conn = psycopg2.connect(
+            host=cfg.db_host,
+            port=cfg.db_port,
+            dbname=cfg.db_name,
+            user=cfg.db_user,
+            password=cfg.db_password,
+            cursor_factory=psycopg2.extras.RealDictCursor,
+        )
         self.conn.autocommit = False
-
-    @staticmethod
-    def _split_table_name(table: str) -> Tuple[str, str]:
-        if "." in table:
-            schema, name = table.split(".", 1)
-            return schema, name
-        return "public", table
+        self.log = logging.getLogger("completitud.db")
 
     def close(self) -> None:
         self.conn.close()
 
-    def __enter__(self) -> "DatabaseManager":
+    def __enter__(self) -> "Database":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -590,127 +301,17 @@ class DatabaseManager:
             self.conn.commit()
         self.close()
 
-    def list_tables(self) -> List[Dict[str, Any]]:
-        query = """
-        SELECT table_schema, table_name, table_type
-        FROM information_schema.tables
-        WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-        ORDER BY table_schema, table_name
-        """
-        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(query)
-            return cur.fetchall()
-
-    def get_table_columns(self, table: str) -> Dict[str, Dict[str, Any]]:
-        schema, name = self._split_table_name(table)
-        query = """
-        SELECT column_name, data_type, udt_name
-        FROM information_schema.columns
-        WHERE table_schema = %s AND table_name = %s
-        ORDER BY ordinal_position
-        """
-        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(query, (schema, name))
-            return {row["column_name"]: dict(row) for row in cur.fetchall()}
-
-    def list_views(self) -> List[Dict[str, Any]]:
-        query = """
-        SELECT table_schema, table_name
-        FROM information_schema.views
-        WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-        ORDER BY table_schema, table_name
-        """
-        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(query)
-            return cur.fetchall()
-
-    def list_foreign_keys(self) -> List[Dict[str, Any]]:
-        query = """
-        SELECT
-            tc.table_schema,
-            tc.table_name,
-            kcu.column_name,
-            ccu.table_schema AS foreign_table_schema,
-            ccu.table_name AS foreign_table_name,
-            ccu.column_name AS foreign_column_name
-        FROM information_schema.table_constraints AS tc
-        JOIN information_schema.key_column_usage AS kcu
-            ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-        JOIN information_schema.constraint_column_usage AS ccu
-            ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
-        WHERE tc.constraint_type = 'FOREIGN KEY'
-        ORDER BY tc.table_schema, tc.table_name
-        """
-        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(query)
-            return cur.fetchall()
-
-    def count_orphans(self, schema: str, table: str, column: str, parent_schema: str, parent_table: str, parent_column: str) -> int:
-        query = f"""
-        SELECT COUNT(*)
-        FROM {schema}.{table} child
-        LEFT JOIN {parent_schema}.{parent_table} parent
-            ON child.{column} = parent.{parent_column}
-        WHERE child.{column} IS NOT NULL AND parent.{parent_column} IS NULL
-        """
+    def fetchall(self, query: str, params: Optional[Sequence[Any]] = None) -> List[Dict[str, Any]]:
         with self.conn.cursor() as cur:
-            cur.execute(query)
-            result = cur.fetchone()
-            return int(result[0]) if result else 0
+            cur.execute(query, params)
+            rows = list(cur.fetchall())
+        return rows
 
-    def fetch_distinct_assets(self, table: str, column: str, limit: Optional[int]) -> List[Any]:
-        query = f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL ORDER BY 1"
-        if limit:
-            query += f" LIMIT {int(limit)}"
+    def fetchone(self, query: str, params: Optional[Sequence[Any]] = None) -> Optional[Dict[str, Any]]:
         with self.conn.cursor() as cur:
-            cur.execute(query)
-            return [row[0] for row in cur.fetchall()]
-
-    def fetch_rows_for_asset(self, table: str, asset_column: str, asset_id: Any, datetime_column: str) -> Iterator[Dict[str, Any]]:
-        cursor_name = f"cur_{table.replace('.', '_')}_{asset_id}"
-        cur = self.conn.cursor(name=cursor_name, cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.itersize = self.cfg.chunk_size
-        query = f"SELECT * FROM {table} WHERE {asset_column} = %s ORDER BY {datetime_column}"
-        cur.execute(query, (asset_id,))
-        for row in cur:
-            yield dict(row)
-        cur.close()
-
-    def fetch_row(
-        self,
-        table: str,
-        asset_column: str,
-        asset_id: Any,
-        datetime_column: str,
-        dt_value: dt.datetime,
-    ) -> Optional[Dict[str, Any]]:
-        query = f"SELECT * FROM {table} WHERE {asset_column} = %s AND {datetime_column} = %s LIMIT 1"
-        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(query, (asset_id, dt_value))
+            cur.execute(query, params)
             row = cur.fetchone()
-            return dict(row) if row else None
-
-    def update_row(
-        self,
-        table: str,
-        asset_column: str,
-        asset_id: Any,
-        datetime_column: str,
-        dt_value: dt.datetime,
-        updates: Dict[str, Any],
-    ) -> bool:
-        if not updates:
-            return False
-        assignments = []
-        values: List[Any] = []
-        for column, value in updates.items():
-            assignments.append(f"{column} = %s")
-            values.append(value)
-        values.extend([asset_id, dt_value])
-        sql = f"UPDATE {table} SET {', '.join(assignments)} WHERE {asset_column} = %s AND {datetime_column} = %s"
-        with self.conn.cursor() as cur:
-            cur.execute(sql, values)
-            return cur.rowcount > 0
+        return row
 
     def execute(self, query: str, params: Optional[Sequence[Any]] = None) -> None:
         with self.conn.cursor() as cur:
@@ -718,1607 +319,923 @@ class DatabaseManager:
 
     def executemany(self, query: str, params_seq: Sequence[Sequence[Any]]) -> None:
         with self.conn.cursor() as cur:
-            psycopg2.extras.execute_batch(cur, query, params_seq)
+            psycopg2.extras.execute_batch(cur, query, params_seq, page_size=500)
 
-    def fetch_asset_metadata(self, query: str) -> Dict[Any, Dict[str, Any]]:
-        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(query)
-            return {row.get("asset_id") or row.get("id"): dict(row) for row in cur.fetchall()}
+    def list_columns(self, table: str) -> List[str]:
+        sql = """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position
+        """
+        rows = self.fetchall(sql, (self.cfg.schema, table))
+        return [r["column_name"] for r in rows]
 
-    def ensure_tables(self, audit_table: str, flags_table: str) -> None:
-        audit_sql = f"""
-        CREATE TABLE IF NOT EXISTS {audit_table} (
-            id SERIAL PRIMARY KEY,
-            executed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            config_hash TEXT NOT NULL,
-            report JSONB NOT NULL
+
+class SchemaInspector:
+    def __init__(self, db: Database, cfg: AppConfig):
+        self.db = db
+        self.cfg = cfg
+        self.log = logging.getLogger("completitud.schema")
+
+    def list_objects(self) -> Dict[str, List[str]]:
+        sql = """
+            SELECT table_name, table_type
+            FROM information_schema.tables
+            WHERE table_schema = %s
+            ORDER BY table_name
+        """
+        rows = self.db.fetchall(sql, (self.cfg.schema,))
+        objects: Dict[str, List[str]] = {"BASE TABLE": [], "VIEW": []}
+        for row in rows:
+            objects.setdefault(row["table_type"], []).append(row["table_name"])
+        return objects
+
+    def find_orphans(self) -> List[str]:
+        findings: List[str] = []
+        asset_table = self.cfg.asset_table
+        asset_col = self.cfg.asset_id_column
+
+        asset_ids = {
+            row[asset_col]
+            for row in self.db.fetchall(
+                f"SELECT {asset_col} FROM {self.cfg.schema}.{asset_table}"
+            )
+        }
+
+        for table_cfg in self.cfg.timeseries_tables:
+            table = f"{self.cfg.schema}.{table_cfg.table}"
+            column_list = self.db.list_columns(table_cfg.table)
+            if table_cfg.asset_column not in column_list:
+                findings.append(
+                    f"La tabla {table_cfg.table} no tiene la columna {table_cfg.asset_column}"
+                )
+                continue
+
+            nulls = self.db.fetchone(
+                f"SELECT COUNT(*) AS cnt FROM {table} WHERE {table_cfg.asset_column} IS NULL"
+            )
+            if nulls and nulls["cnt"]:
+                findings.append(
+                    f"{table_cfg.table}: {nulls['cnt']} filas con asset_id nulo"
+                )
+
+            if asset_ids:
+                missing = self.db.fetchall(
+                    f"SELECT DISTINCT {table_cfg.asset_column} AS asset_id "
+                    f"FROM {table} WHERE {table_cfg.asset_column} IS NOT NULL "
+                    f"AND {table_cfg.asset_column} NOT IN %s",
+                    (tuple(asset_ids),),
+                )
+                if missing:
+                    ids = ", ".join(str(r["asset_id"]) for r in missing[:10])
+                    findings.append(
+                        f"{table_cfg.table}: asset_id sin correspondencia ({ids})"
+                    )
+        return findings
+
+    def report(self) -> str:
+        objects = self.list_objects()
+        orphan_findings = self.find_orphans()
+        lines = ["Objetos del esquema:"]
+        lines.append(
+            "  Tablas: " + ", ".join(sorted(objects.get("BASE TABLE", [])))
         )
-        """
-        flags_sql = f"""
-        CREATE TABLE IF NOT EXISTS {flags_table} (
-            id SERIAL PRIMARY KEY,
-            table_name TEXT NOT NULL,
-            asset_id TEXT,
-            datetime_value TIMESTAMPTZ,
-            failure_count INTEGER NOT NULL DEFAULT 0,
-            last_error TEXT,
-            last_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE (table_name, asset_id, datetime_value)
-        )
-        """
-        self.execute(audit_sql)
-        self.execute(flags_sql)
+        lines.append("  Vistas: " + ", ".join(sorted(objects.get("VIEW", []))))
+        if orphan_findings:
+            lines.append("Elementos huérfanos o inconsistentes:")
+            lines.extend(f"  - {item}" for item in orphan_findings)
+        else:
+            lines.append("No se detectaron elementos huérfanos.")
+        report = "\n".join(lines)
+        self.log.info("%s", report.replace("\n", " | "))
+        return report
 
-    def get_flag(self, table: str, asset_id: Any, dt_value: dt.datetime) -> Optional[Dict[str, Any]]:
-        query = f"""
-        SELECT * FROM {self.cfg.flags_table}
-        WHERE table_name = %s AND asset_id = %s AND datetime_value = %s
-        """
-        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(query, (table, str(asset_id), dt_value))
-            row = cur.fetchone()
-            return dict(row) if row else None
 
-    def upsert_flag(self, table: str, asset_id: Any, dt_value: dt.datetime, error: str) -> None:
-        query = f"""
-        INSERT INTO {self.cfg.flags_table} (table_name, asset_id, datetime_value, failure_count, last_error, last_attempt_at)
-        VALUES (%s, %s, %s, 1, %s, NOW())
-        ON CONFLICT (table_name, asset_id, datetime_value)
-        DO UPDATE SET failure_count = {self.cfg.flags_table}.failure_count + 1, last_error = EXCLUDED.last_error, last_attempt_at = NOW()
-        """
-        self.execute(query, (table, str(asset_id), dt_value, error[:500]))
+class AssetResolver:
+    def __init__(self, db: Database, cfg: AppConfig):
+        self.db = db
+        self.cfg = cfg
+        self.log = logging.getLogger("completitud.assets")
+        self.cache: Dict[Any, Dict[str, Any]] = {}
 
-    def clear_flag(self, table: str, asset_id: Any, dt_value: dt.datetime) -> None:
-        query = f"DELETE FROM {self.cfg.flags_table} WHERE table_name = %s AND asset_id = %s AND datetime_value = %s"
-        self.execute(query, (table, str(asset_id), dt_value))
-
-    def insert_rows(self, table: str, columns: Sequence[str], rows: Sequence[Sequence[Any]], conflict_columns: Sequence[str]) -> None:
-        if not rows:
-            return
-        cols = ", ".join(columns)
-        placeholders = ", ".join(["%s"] * len(columns))
-        conflict = ", ".join(conflict_columns)
-        update_assignments = ", ".join([f"{col} = EXCLUDED.{col}" for col in columns if col not in conflict_columns])
-        sql = f"""
-        INSERT INTO {table} ({cols}) VALUES ({placeholders})
-        ON CONFLICT ({conflict}) DO UPDATE SET {update_assignments}
-        """
-        self.executemany(sql, rows)
-
-    def list_flags(self) -> List[Dict[str, Any]]:
-        query = f"SELECT table_name, asset_id, datetime_value, failure_count, last_error, last_attempt_at FROM {self.cfg.flags_table}"
+    def load(self) -> None:
         try:
-            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(query)
-                return [dict(row) for row in cur.fetchall()]
-        except Exception:
-            return []
+            sql = (
+                f"SELECT {self.cfg.asset_id_column} AS asset_id, {self.cfg.asset_symbol_column} AS symbol "
+                f"FROM {self.cfg.schema}.{self.cfg.asset_table}"
+            )
+            rows = self.db.fetchall(sql)
+        except Exception as exc:
+            self.log.error("No se pudieron cargar los activos: %s", exc)
+            rows = []
+        self.cache = {row["asset_id"]: row for row in rows if row.get("asset_id") is not None}
+        self.log.info("Cargados %d activos", len(self.cache))
+
+    def get(self, asset_id: Any) -> Optional[Dict[str, Any]]:
+        if not self.cache:
+            self.load()
+        return self.cache.get(asset_id)
+
+
+class GapAnalysisResult:
+    def __init__(self) -> None:
+        self.tables: Dict[str, Dict[Any, Dict[str, Any]]] = defaultdict(dict)
+
+    def add_asset(self, table: TableConfig, asset_id: Any, payload: Dict[str, Any]) -> None:
+        self.tables[table.table][asset_id] = payload
+
+    def to_json(self) -> Dict[str, Any]:
+        return self.tables
+
+    def iter_missing(self) -> Iterable[Tuple[TableConfig, Any, Dict[str, Any]]]:
+        for table_name, assets in self.tables.items():
+            for asset_id, payload in assets.items():
+                if payload.get("missing_dates") or payload.get("field_gaps"):
+                    yield table_name, asset_id, payload
+
+
+def _resolve_tz(tz_name: str) -> dt.tzinfo:
+    if tz_name.upper() == "UTC":
+        return dt.timezone.utc
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+
+
+def to_timezone(value: dt.datetime, tz_name: str) -> dt.datetime:
+    tzinfo = _resolve_tz(tz_name)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.timezone.utc)
+    return value.astimezone(tzinfo)
+
+
+def normalize_datetime(value: Any, tz_name: str) -> Optional[dt.datetime]:
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return to_timezone(value, tz_name)
+    if isinstance(value, dt.date):
+        tzinfo = _resolve_tz(tz_name)
+        return dt.datetime.combine(value, dt.time(0, 0), tzinfo=tzinfo)
+    raise TypeError(f"No puedo convertir {value!r} a datetime")
+
 
 def is_placeholder(value: Any) -> bool:
     if value is None:
         return True
-    if isinstance(value, str) and value.strip().lower() in PLACEHOLDER_VALUES:
-        return True
-    if isinstance(value, (float, Decimal)) and (pd.isna(value) or math.isnan(float(value))):
+    if isinstance(value, str):
+        return value.strip().lower() in PLACEHOLDER_VALUES
+    if isinstance(value, float) and math.isnan(value):
         return True
     return False
 
 
-def is_missing_value(value: Any) -> bool:
-    return is_placeholder(value)
-
-
-def as_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (float, int, Decimal)):
-        return float(value)
-    if isinstance(value, str):
-        value = value.strip()
-        if value == "":
+def extract_nested(record: Dict[str, Any], path: str) -> Any:
+    current: Any = record
+    for part in path.split("."):
+        if current is None:
             return None
-        try:
-            return float(value)
-        except ValueError:
+        if isinstance(current, dict):
+            current = current.get(part)
+        else:
             return None
-    return None
+    return current
 
 
-def is_business_day(ts: pd.Timestamp) -> bool:
-    return bool(ts.weekday() < 5)
+def map_remote_record(record: Dict[str, Any], field_map: Dict[str, str]) -> Dict[str, Any]:
+    if not field_map:
+        return dict(record)
+    mapped: Dict[str, Any] = {}
+    for local_field, remote_field in field_map.items():
+        value = extract_nested(record, remote_field)
+        if value is None and remote_field.endswith(".mid"):
+            base = remote_field.rsplit(".", 1)[0]
+            bid = extract_nested(record, f"{base}.bid")
+            ask = extract_nested(record, f"{base}.ask")
+            if bid is not None and ask is not None:
+                try:
+                    value = (float(bid) + float(ask)) / 2
+                except (TypeError, ValueError):
+                    value = None
+        mapped[local_field] = value
+    return mapped
 
 
-def compress_missing_dates(dates: List[pd.Timestamp]) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
-    if not dates:
-        return []
-    dates = sorted(dates)
-    ranges: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
-    start = dates[0]
-    prev = dates[0]
-    for current in dates[1:]:
-        if current - prev > pd.Timedelta(days=1):
-            ranges.append((start, prev))
-            start = current
-        prev = current
-    ranges.append((start, prev))
-    return ranges
-
-class DataCompletenessAuditor:
+class TimeseriesAnalyzer:
     def __init__(
         self,
+        db: Database,
         cfg: AppConfig,
-        db: DatabaseManager,
-        capital: CapitalComClient,
-        fmp: FMPClient,
-        yf_client: YahooFinanceClient,
-    ) -> None:
-        self.cfg = cfg
+        assets: AssetResolver,
+        max_assets: Optional[int] = None,
+    ):
         self.db = db
-        self.capital = capital
-        self.fmp = fmp
-        self.yf_client = yf_client
-        self.logger = logging.getLogger("DataCompletenessAuditor")
-        self.asset_metadata: Dict[Any, Dict[str, Any]] = {}
-        self._normalize_cache: Dict[str, Dict[Any, Optional[pd.Timestamp]]] = {}
-        self.table_columns: Dict[str, Dict[str, Any]] = {}
-        if cfg.asset_lookup_query:
-            try:
-                self.asset_metadata = db.fetch_asset_metadata(cfg.asset_lookup_query)
-            except Exception as exc:
-                self.logger.warning("No se pudo obtener metadata de activos: %s", exc)
-        self._prepare_table_configs()
+        self.cfg = cfg
+        self.assets = assets
+        self.log = logging.getLogger("completitud.analyzer")
+        self.max_assets = max_assets
 
-    def _prepare_table_configs(self) -> None:
-        for table_cfg in self.cfg.tables:
+    def run(self) -> GapAnalysisResult:
+        result = GapAnalysisResult()
+        for table_cfg in self.cfg.timeseries_tables:
+            self.log.info("Analizando tabla %s", table_cfg.table)
             try:
-                columns = self.db.get_table_columns(table_cfg.table)
+                columns = self.db.list_columns(table_cfg.table)
             except Exception as exc:
-                self.logger.error(
-                    "No se pudieron obtener las columnas de %s: %s", table_cfg.table, exc
-                )
-                table_cfg.enabled = False
+                self.log.error("No se pudieron listar columnas de %s: %s", table_cfg.table, exc)
                 continue
-            self.table_columns[table_cfg.table] = columns
-            self._normalize_table_config(table_cfg, columns)
 
-    @staticmethod
-    def _pick_column(
-        columns: Dict[str, Dict[str, Any]],
-        candidates: Sequence[Optional[str]],
-        type_hints: Optional[Sequence[str]] = None,
-    ) -> Optional[str]:
-        for candidate in candidates:
-            if candidate and candidate in columns:
-                return candidate
-        if type_hints:
-            lowered_hints = {hint.lower() for hint in type_hints}
-            for name, meta in columns.items():
-                data_type = str(meta.get("data_type", "")).lower()
-                udt = str(meta.get("udt_name", "")).lower()
-                if data_type in lowered_hints or udt in lowered_hints:
-                    return name
-        return None
+            if not table_cfg.fields:
+                table_cfg.fields = [
+                    c
+                    for c in columns
+                    if c not in {table_cfg.asset_column, table_cfg.datetime_column}
+                ]
 
-    def _normalize_table_config(
-        self, cfg: TimeseriesTableConfig, columns: Dict[str, Dict[str, Any]]
-    ) -> None:
-        asset_col = cfg.asset_column
-        if asset_col not in columns:
-            replacement = self._pick_column(
-                columns,
-                [
-                    asset_col,
-                    "asset_id",
-                    "id_activo",
-                    "id_asset",
-                    "instrument_id",
-                ],
-                ("integer", "bigint", "uuid", "text"),
-            )
-            if replacement:
-                self.logger.info(
-                    "Columna de activo %s no encontrada en %s, se usará %s",
-                    asset_col,
-                    cfg.table,
-                    replacement,
-                )
-                cfg.asset_column = replacement
-            else:
-                self.logger.error(
-                    "No se encontró ninguna columna de activo para %s; se deshabilita la tabla",
-                    cfg.table,
-                )
-                cfg.enabled = False
-                return
+            asset_ids = self._list_asset_ids(table_cfg)
+            for asset_id in asset_ids:
+                payload = self._analyze_asset(table_cfg, asset_id)
+                result.add_asset(table_cfg, asset_id, payload)
+        return result
 
-        dt_col = cfg.datetime_column
-        if dt_col not in columns:
-            replacement = self._pick_column(
-                columns,
-                [
-                    dt_col,
-                    "fecha",
-                    "timestamp",
-                    "fecha_hora",
-                    "fechaHora",
-                    "datetime",
-                    "ts",
-                ],
-                ("timestamp with time zone", "timestamp without time zone", "timestamptz"),
-            )
-            if replacement:
-                self.logger.info(
-                    "Columna temporal %s no encontrada en %s, se usará %s",
-                    dt_col,
-                    cfg.table,
-                    replacement,
-                )
-                cfg.datetime_column = replacement
-            else:
-                self.logger.error(
-                    "No se encontró ninguna columna temporal para %s; se deshabilita la tabla",
-                    cfg.table,
-                )
-                cfg.enabled = False
-                return
+    def _list_asset_ids(self, table_cfg: TableConfig) -> List[Any]:
+        sql = (
+            f"SELECT DISTINCT {table_cfg.asset_column} AS asset_id "
+            f"FROM {self.cfg.schema}.{table_cfg.table} "
+            f"WHERE {table_cfg.asset_column} IS NOT NULL"
+        )
+        rows = self.db.fetchall(sql)
+        asset_ids = [row["asset_id"] for row in rows]
+        if self.max_assets is not None:
+            return asset_ids[: self.max_assets]
+        return asset_ids
 
-        existing_data_columns = [col for col in cfg.data_columns if col in columns]
-        missing_data_columns = [col for col in cfg.data_columns if col not in columns]
-        if missing_data_columns:
-            self.logger.warning(
-                "Columnas de datos ausentes en %s: %s", cfg.table, ", ".join(missing_data_columns)
-            )
-        if not existing_data_columns:
-            self.logger.error(
-                "No quedan columnas de datos válidas en %s; se deshabilita la tabla",
-                cfg.table,
-            )
-            cfg.enabled = False
-            return
-        if existing_data_columns != cfg.data_columns:
-            cfg.data_columns = existing_data_columns
+    def _fetch_asset_frame(self, table_cfg: TableConfig, asset_id: Any) -> pd.DataFrame:
+        columns = [table_cfg.datetime_column, table_cfg.asset_column] + table_cfg.fields
+        sql = (
+            f"SELECT {', '.join(columns)} "
+            f"FROM {self.cfg.schema}.{table_cfg.table} "
+            f"WHERE {table_cfg.asset_column} = %s "
+            f"ORDER BY {table_cfg.datetime_column}"
+        )
+        rows = self.db.fetchall(sql, (asset_id,))
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return frame
+        frame[table_cfg.datetime_column] = frame[table_cfg.datetime_column].apply(
+            lambda v: normalize_datetime(v, table_cfg.timezone)
+        )
+        frame.set_index(table_cfg.datetime_column, inplace=True)
+        return frame
 
-        if cfg.conflict_columns:
-            conflict = [col for col in cfg.conflict_columns if col in columns]
-        else:
-            conflict = []
-        if cfg.asset_column not in conflict:
-            conflict.append(cfg.asset_column)
-        if cfg.datetime_column not in conflict:
-            conflict.append(cfg.datetime_column)
-        cfg.conflict_columns = conflict
+    def _analyze_asset(self, table_cfg: TableConfig, asset_id: Any) -> Dict[str, Any]:
+        frame = self._fetch_asset_frame(table_cfg, asset_id)
+        if frame.empty:
+            return {
+                "asset_id": asset_id,
+                "rows": 0,
+                "missing_dates": [],
+                "field_gaps": {},
+                "semantic_issues": [],
+                "derived_updates": 0,
+            }
 
-    def _table_timezone(self, cfg: TimeseriesTableConfig) -> str:
-        return cfg.timezone or self.cfg.timezone or "UTC"
-
-    @staticmethod
-    def _tz_identifier(tzinfo: Optional[dt.tzinfo]) -> Optional[str]:
-        if tzinfo is None:
-            return None
-        for attr in ("key", "zone"):
-            val = getattr(tzinfo, attr, None)
-            if val:
-                return str(val)
-        name = tzinfo.tzname(None)
-        if name:
-            return name
-        return str(tzinfo)
-
-    def _parse_timestamp(self, cfg: TimeseriesTableConfig, value: Any) -> Optional[pd.Timestamp]:
-        try:
-            ts = pd.Timestamp(value)
-        except Exception:
-            self.logger.debug("No se pudo interpretar timestamp %s para %s", value, cfg.table)
-            return None
-        if pd.isna(ts):
-            return None
-        tz_name = self._table_timezone(cfg)
-        if tz_name:
-            try:
-                if ts.tzinfo is None:
-                    ts = ts.tz_localize(tz_name)
-                else:
-                    current_tz = self._tz_identifier(ts.tzinfo)
-                    if current_tz != tz_name:
-                        ts = ts.tz_convert(tz_name)
-            except Exception:
-                self.logger.debug(
-                    "Fallo al ajustar zona horaria %s para %s en %s", tz_name, value, cfg.table,
-                    exc_info=True,
-                )
-                if ts.tzinfo is None:
-                    ts = ts.tz_localize("UTC")
-                else:
-                    ts = ts.tz_convert("UTC")
-        elif ts.tzinfo is not None:
-            ts = ts.tz_convert("UTC")
-        return ts
-
-    def _apply_table_timezone(self, cfg: TimeseriesTableConfig, series: pd.Series) -> pd.Series:
-        return series.apply(lambda val: self._parse_timestamp(cfg, val))
-
-    def _current_timestamp(self, cfg: TimeseriesTableConfig) -> pd.Timestamp:
-        tz_name = self._table_timezone(cfg) or "UTC"
-        now_utc = pd.Timestamp.now(tz="UTC")
-        return now_utc if tz_name == "UTC" else now_utc.tz_convert(tz_name)
-
-    @staticmethod
-    def _to_utc_timestamp(ts: pd.Timestamp) -> pd.Timestamp:
-        if ts.tzinfo is None:
-            return ts.tz_localize("UTC")
-        return ts.tz_convert("UTC")
-
-    def _to_utc_datetime(self, ts: pd.Timestamp) -> dt.datetime:
-        return self._to_utc_timestamp(pd.Timestamp(ts)).to_pydatetime()
-
-    @staticmethod
-    def _provider_label(provider: str) -> str:
-        return PROVIDER_LABELS.get(provider, provider)
-
-    def _resolve_field_map(
-        self,
-        cfg: TimeseriesTableConfig,
-        provider: str,
-        fields_sorted: Sequence[str],
-    ) -> Dict[str, str]:
-        mapping: Optional[Dict[str, str]] = None
-        if cfg.field_mappings:
-            for key in (
-                f"{provider}_{cfg.frequency}",
-                cfg.frequency,
-                provider,
-                "default",
-            ):
-                candidate = cfg.field_mappings.get(key)
-                if isinstance(candidate, dict):
-                    mapping = candidate
-                    break
-        if mapping is None:
-            if provider == "capital":
-                mapping = CAPITAL_FIELD_MAP
-            elif provider == "fmp":
-                mapping = FMP_DAILY_FIELD_MAP if cfg.frequency == "daily" else FMP_INTRADAY_FIELD_MAP
-            else:
-                mapping = {}
-        return {field: mapping.get(field, field) for field in fields_sorted}
-
-    def _resolve_endpoint(
-        self,
-        cfg: TimeseriesTableConfig,
-        provider: str,
-        interval_minutes: Optional[int] = None,
-    ) -> str:
-        template: Optional[str] = None
-        if cfg.endpoint_templates:
-            for key in (
-                f"{provider}_{cfg.frequency}",
-                cfg.frequency,
-                provider,
-                "default",
-            ):
-                candidate = cfg.endpoint_templates.get(key)
-                if candidate:
-                    template = candidate
-                    break
-        if not template:
-            if provider == "capital":
-                template = "/prices/{epic}"
-            elif provider == "fmp":
-                if cfg.frequency == "daily":
-                    template = "/historical-price-full/{symbol}"
-                else:
-                    interval = interval_minutes or cfg.interval_minutes or 1
-                    template = f"/historical-chart/{interval}min/{{symbol}}"
-            else:
-                template = ""
-        interval_value = interval_minutes or cfg.interval_minutes or 1
-        return template.replace("{interval}", str(interval_value))
-
-    def inspect_schema(self) -> Dict[str, Any]:
-        tables = self.db.list_tables()
-        views = self.db.list_views()
-        fks = self.db.list_foreign_keys()
-        orphan_info = []
-        for fk in fks:
-            try:
-                count = self.db.count_orphans(
-                    schema=fk["table_schema"],
-                    table=fk["table_name"],
-                    column=fk["column_name"],
-                    parent_schema=fk["foreign_table_schema"],
-                    parent_table=fk["foreign_table_name"],
-                    parent_column=fk["foreign_column_name"],
-                )
-            except Exception as exc:
-                self.logger.warning("Fallo al contar huérfanos en %s.%s: %s", fk["table_name"], fk["column_name"], exc)
-                continue
-            if count > 0:
-                orphan_info.append(
-                    {
-                        "tabla": f"{fk['table_schema']}.{fk['table_name']}",
-                        "columna": fk["column_name"],
-                        "padre": f"{fk['foreign_table_schema']}.{fk['foreign_table_name']}",
-                        "columna_padre": fk["foreign_column_name"],
-                        "registros_huerfanos": count,
-                    }
-                )
+        derived_updates = self._fill_derived_fields(table_cfg, asset_id, frame)
+        missing_dates = self._detect_missing_dates(table_cfg, frame)
+        field_gaps = self._detect_field_gaps(frame)
+        semantic_issues = self._semantic_checks(frame)
 
         return {
-            "tablas": tables,
-            "vistas": views,
-            "foreign_keys": fks,
-            "elementos_huerfanos": orphan_info,
-        }
-
-    def analyse_table(self, cfg: TimeseriesTableConfig) -> Dict[str, Any]:
-        if not cfg.enabled:
-            self.logger.info("Tabla %s omitida por configuración deshabilitada", cfg.table)
-            return {"status": "skipped"}
-        self.logger.info("Analizando %s", cfg.table)
-        assets = self.db.fetch_distinct_assets(cfg.table, cfg.asset_column, self.cfg.max_assets)
-        null_query = f"SELECT COUNT(*) FROM {cfg.table} WHERE {cfg.asset_column} IS NULL"
-        try:
-            with self.db.conn.cursor() as cur:
-                cur.execute(null_query)
-                null_assets = int(cur.fetchone()[0])
-        except Exception:
-            null_assets = 0
-        report: Dict[str, Any] = {
-            "table": cfg.table,
-            "asset_column": cfg.asset_column,
-            "datetime_column": cfg.datetime_column,
-            "assets": {},
-            "sin_asset_id": null_assets,
-        }
-        for asset_id in assets:
-            asset_report = self.analyse_asset(cfg, asset_id)
-            report["assets"][str(asset_id)] = asset_report
-        return report
-
-    def analyse_asset(self, cfg: TimeseriesTableConfig, asset_id: Any) -> Dict[str, Any]:
-        issues: Dict[str, Any] = {
-            "missing_rows": [],
-            "invalid_rows": [],
-            "missing_dates": [],
-            "stats": {
-                "rows": 0,
-                "missing_field_rows": 0,
-                "invalid_rows": 0,
-            },
-            "metadata": {},
-        }
-
-        rows: List[Dict[str, Any]] = []
-        for row in self.db.fetch_rows_for_asset(cfg.table, cfg.asset_column, asset_id, cfg.datetime_column):
-            rows.append(row)
-
-        if not rows:
-            return issues
-
-        df = pd.DataFrame(rows)
-        if cfg.datetime_column not in df.columns:
-            self.logger.warning("La tabla %s no contiene la columna temporal %s", cfg.table, cfg.datetime_column)
-            return issues
-
-        df[cfg.datetime_column] = self._apply_table_timezone(cfg, df[cfg.datetime_column])
-        missing_ts_mask = df[cfg.datetime_column].isna()
-        if missing_ts_mask.any():
-            for idx, row in df[missing_ts_mask].iterrows():
-                issues["missing_rows"].append(
-                    {
-                        "index": int(idx),
-                        "timestamp": None,
-                        "row": {col: row.get(col) for col in cfg.data_columns},
-                    }
-                )
-        df = df[~missing_ts_mask].copy()
-        if df.empty:
-            return issues
-        df[cfg.datetime_column] = pd.to_datetime(df[cfg.datetime_column])
-        df = df.sort_values(cfg.datetime_column).reset_index(drop=True)
-        issues["stats"]["rows"] = len(df)
-        sample_row = df.iloc[0].to_dict()
-        issues["metadata"] = {
             "asset_id": asset_id,
-            "symbol": sample_row.get("symbol") if "symbol" in sample_row else None,
-            "epic": sample_row.get("epic") if "epic" in sample_row else None,
+            "rows": int(len(frame)),
+            "missing_dates": [dt.isoformat() for dt in missing_dates],
+            "field_gaps": field_gaps,
+            "semantic_issues": semantic_issues,
+            "derived_updates": derived_updates,
         }
-        if cfg.symbol_column and cfg.symbol_column in sample_row:
-            issues["metadata"]["symbol"] = sample_row.get(cfg.symbol_column)
 
-        missing_dates: List[pd.Timestamp] = []
+    def _detect_missing_dates(
+        self, table_cfg: TableConfig, frame: pd.DataFrame
+    ) -> List[dt.datetime]:
+        if frame.empty:
+            return []
+        index: pd.DatetimeIndex = frame.index.sort_values()
+        start, end = index.min(), index.max()
+        if table_cfg.frequency == "daily":
+            freq = "B" if table_cfg.skip_weekends else "D"
+        elif table_cfg.frequency == "intraday":
+            interval = table_cfg.interval_minutes or 5
+            minutes = f"{interval}min"
+            freq = minutes
+        else:
+            freq = "D"
+        expected = pd.date_range(start=start, end=end, freq=freq, tz=start.tz)
+        missing = expected.difference(index)
+        if table_cfg.frequency == "daily" and table_cfg.skip_weekends:
+            missing = pd.DatetimeIndex(
+                [d for d in missing if d.weekday() < 5]
+            )
+        return list(missing.to_pydatetime())
 
-        for idx, row in df.iterrows():
-            timestamp = row[cfg.datetime_column]
-            row_missing = False
-            row_invalid = False
+    def _detect_field_gaps(self, frame: pd.DataFrame) -> Dict[str, int]:
+        gaps: Dict[str, int] = {}
+        for column in frame.columns:
+            series = frame[column]
+            gap_mask = series.isna()
+            if series.dtype == object:
+                gap_mask |= series.map(is_placeholder)
+            if column in {"volume"}:
+                gap_mask |= series.fillna(0) == 0
+            count = int(gap_mask.sum())
+            if count:
+                gaps[column] = count
+        return gaps
 
-            for col in cfg.data_columns:
-                if col not in row:
-                    continue
-                value = row[col]
-                if is_placeholder(value):
-                    row_missing = True
-                    continue
-                numeric_value = as_float(value)
-                if numeric_value is None:
-                    row_invalid = True
-                    continue
-                if col in {"open", "high", "low", "close"} and numeric_value < 0:
-                    row_invalid = True
-                if col == "volume" and numeric_value <= 0:
-                    row_invalid = True
-                if cfg.price_floor is not None and numeric_value < cfg.price_floor:
-                    row_invalid = True
-                if cfg.price_ceiling is not None and numeric_value > cfg.price_ceiling:
-                    row_invalid = True
-
-            open_px = as_float(row.get("open"))
-            high_px = as_float(row.get("high"))
-            low_px = as_float(row.get("low"))
-            close_px = as_float(row.get("close"))
-            if None not in (open_px, high_px, low_px, close_px):
-                assert open_px is not None and high_px is not None and low_px is not None and close_px is not None
-                if open_px > high_px + 1e-9 or close_px > high_px + 1e-9:
-                    row_invalid = True
-                if low_px > open_px + 1e-9 or low_px > close_px + 1e-9:
-                    row_invalid = True
-                if high_px < low_px:
-                    row_invalid = True
-
-            if row_missing:
-                issues["missing_rows"].append(
-                    {
-                        "index": int(idx),
-                        "timestamp": timestamp.isoformat(),
-                        "row": {col: row.get(col) for col in cfg.data_columns},
-                    }
-                )
-            if row_invalid:
-                issues["invalid_rows"].append(
-                    {
-                        "index": int(idx),
-                        "timestamp": timestamp.isoformat(),
-                        "row": {col: row.get(col) for col in cfg.data_columns},
-                    }
-                )
-
-        issues["stats"]["missing_field_rows"] = len(issues["missing_rows"])
-        issues["stats"]["invalid_rows"] = len(issues["invalid_rows"])
-
-        timestamps = df[cfg.datetime_column].tolist()
-        expected_delta = cfg.expected_timedelta()
-        if expected_delta is not None and timestamps:
-            for prev, current in zip(timestamps, timestamps[1:]):
-                delta = current - prev
-                if cfg.frequency == "daily":
-                    if delta > pd.Timedelta(days=1):
-                        missing_range = pd.date_range(prev + pd.Timedelta(days=1), current - pd.Timedelta(days=1), freq="D")
-                        for missing in missing_range:
-                            if cfg.allow_weekends or is_business_day(missing):
-                                missing_dates.append(missing)
-                else:
-                    if expected_delta and delta > expected_delta:
-                        steps = int(delta / expected_delta)
-                        for step in range(1, steps):
-                            missing_dates.append(prev + step * expected_delta)
-
-        if timestamps:
-            last_ts = timestamps[-1]
-            now_ts = self._current_timestamp(cfg)
-            if cfg.frequency == "daily":
-                expected_last = now_ts.normalize()
-                while not cfg.allow_weekends and not is_business_day(expected_last):
-                    expected_last -= pd.Timedelta(days=1)
-                if last_ts.normalize() < expected_last:
-                    future_range = pd.date_range(last_ts + pd.Timedelta(days=1), expected_last, freq="D")
-                    for missing in future_range:
-                        if cfg.allow_weekends or is_business_day(missing):
-                            missing_dates.append(missing)
-            elif expected_delta is not None:
-                gap = now_ts - last_ts
-                if gap >= expected_delta:
-                    steps = int(math.ceil(gap / expected_delta))
-                    for step in range(1, steps + 1):
-                        missing_dates.append(last_ts + step * expected_delta)
-
-        unique_missing = sorted({pd.Timestamp(ts) for ts in missing_dates})
-        issues["missing_dates"] = [ts.isoformat() for ts in unique_missing]
+    def _semantic_checks(self, frame: pd.DataFrame) -> List[str]:
+        issues: List[str] = []
+        for ts, row in frame.iterrows():
+            open_p = row.get("open")
+            high = row.get("high")
+            low = row.get("low")
+            close = row.get("close")
+            volume = row.get("volume")
+            if open_p is not None and high is not None and open_p > high:
+                issues.append(f"{ts.isoformat()} open>high")
+            if low is not None and close is not None and low > close:
+                issues.append(f"{ts.isoformat()} low>close")
+            if volume is not None and volume == 0:
+                issues.append(f"{ts.isoformat()} volumen cero")
         return issues
 
-    def analyse_all_tables(self) -> Dict[str, Any]:
-        results = {}
-        for table_cfg in self.cfg.tables:
-            if not table_cfg.enabled:
-                self.logger.info(
-                    "Se omite %s porque no se pudo validar su configuración", table_cfg.table
-                )
-                results[table_cfg.table] = {"status": "skipped"}
-                continue
-            results[table_cfg.table] = self.analyse_table(table_cfg)
-        return results
+    def _fill_derived_fields(
+        self, table_cfg: TableConfig, asset_id: Any, frame: pd.DataFrame
+    ) -> int:
+        updates: List[Tuple[Any, dt.datetime, Dict[str, Any]]] = []
+        for ts, row in frame.iterrows():
+            update: Dict[str, Any] = {}
+            # Dividend adjusted
+            factor = None
+            if not pd.isna(row.get("divadj_close")) and not pd.isna(row.get("close")):
+                close = row.get("close")
+                if close not in (None, 0):
+                    factor = row.get("divadj_close") / close
+            for field in ["open", "high", "low"]:
+                target = f"divadj_{field}"
+                if target in frame.columns and pd.isna(row.get(target)) and factor is not None:
+                    base = row.get(field)
+                    if base not in (None, 0):
+                        update[target] = round(base * factor, 8)
 
-    def refill_data(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.cfg.enable_refill:
-            self.logger.info("Relleno deshabilitado por configuración")
-            return {}
-        refill_report: Dict[str, Any] = {}
-        for table_cfg in self.cfg.tables:
-            if not table_cfg.enabled:
-                continue
-            table_result = analysis.get(table_cfg.table, {})
-            asset_reports = table_result.get("assets", {}) if isinstance(table_result, dict) else {}
-            table_actions: List[Dict[str, Any]] = []
-            for asset_id, asset_report in asset_reports.items():
-                actions = self._refill_asset(table_cfg, asset_id, asset_report)
-                if actions:
-                    table_actions.extend(actions)
-            if table_actions:
-                refill_report[table_cfg.table] = table_actions
-        return refill_report
+            if pd.isna(row.get("change")) and not pd.isna(row.get("open")) and not pd.isna(row.get("close")):
+                update["change"] = row.get("close") - row.get("open")
+            if (
+                pd.isna(row.get("change_percent"))
+                and not pd.isna(row.get("open"))
+                and row.get("open") not in (None, 0)
+                and not pd.isna(row.get("close"))
+            ):
+                update["change_percent"] = (row.get("close") - row.get("open")) / row.get("open") * 100
 
-    def _refill_asset(self, cfg: TimeseriesTableConfig, asset_id: Any, asset_report: Dict[str, Any]) -> List[Dict[str, Any]]:
-        timestamps: List[pd.Timestamp] = []
-        for date_str in asset_report.get("missing_dates", []):
-            ts = self._parse_timestamp(cfg, date_str)
-            if ts is not None:
-                timestamps.append(ts)
-        for row_issue in asset_report.get("missing_rows", []) + asset_report.get("invalid_rows", []):
-            ts_raw = row_issue.get("timestamp")
-            if not ts_raw:
-                continue
-            ts = self._parse_timestamp(cfg, ts_raw)
-            if ts is not None:
-                timestamps.append(ts)
-        if not timestamps:
-            return []
+            if "ts_epoch" in frame.columns and (pd.isna(row.get("ts_epoch")) or row.get("ts_epoch") == 0):
+                update["ts_epoch"] = int(ts.timestamp())
 
-        metadata = dict(asset_report.get("metadata") or {})
-        metadata.update(self.asset_metadata.get(asset_id, {}))
-        symbol = metadata.get("symbol") or metadata.get("ticker") or metadata.get("symbol_local")
-        epic = metadata.get("epic") or metadata.get("epic_code")
-        actions: List[Dict[str, Any]] = []
+            if (
+                "spread_open" in frame.columns
+                and pd.isna(row.get("spread_open"))
+                and not pd.isna(row.get("open_bid"))
+                and not pd.isna(row.get("open_ask"))
+            ):
+                update["spread_open"] = row.get("open_ask") - row.get("open_bid")
+            if (
+                "spread_close" in frame.columns
+                and pd.isna(row.get("spread_close"))
+                and not pd.isna(row.get("close_bid"))
+                and not pd.isna(row.get("close_ask"))
+            ):
+                update["spread_close"] = row.get("close_ask") - row.get("close_bid")
 
-        resolved_ts, derivation_actions, derived_fields = self._attempt_derivations(cfg, asset_id, asset_report)
-        actions.extend(derivation_actions)
-        if resolved_ts:
-            timestamps = [
-                ts
-                for ts in timestamps
-                if (ts.normalize() if cfg.frequency == "daily" else ts) not in resolved_ts
-            ]
+            if (
+                "open_bid" in frame.columns
+                and pd.isna(row.get("open_bid"))
+                and not pd.isna(row.get("open"))
+                and not pd.isna(row.get("spread_open"))
+            ):
+                update["open_bid"] = row.get("open") - row.get("spread_open") / 2
+            if (
+                "open_ask" in frame.columns
+                and pd.isna(row.get("open_ask"))
+                and not pd.isna(row.get("open"))
+                and not pd.isna(row.get("spread_open"))
+            ):
+                update["open_ask"] = row.get("open") + row.get("spread_open") / 2
+            if (
+                "open" in frame.columns
+                and pd.isna(row.get("open"))
+                and not pd.isna(row.get("open_bid"))
+                and not pd.isna(row.get("open_ask"))
+            ):
+                update["open"] = (row.get("open_bid") + row.get("open_ask")) / 2
 
-        timestamps = sorted({ts.normalize() if cfg.frequency == "daily" else ts for ts in timestamps})
-        expected_delta = cfg.expected_timedelta() or pd.Timedelta(days=1)
-        groups: List[List[pd.Timestamp]] = []
-        current_group: List[pd.Timestamp] = []
-        for ts in timestamps:
-            if not current_group:
-                current_group = [ts]
-                continue
-            if ts - current_group[-1] <= expected_delta * 2:
-                current_group.append(ts)
-            else:
-                groups.append(current_group)
-                current_group = [ts]
-        if current_group:
-            groups.append(current_group)
+            if (
+                "close_bid" in frame.columns
+                and pd.isna(row.get("close_bid"))
+                and not pd.isna(row.get("close"))
+                and not pd.isna(row.get("spread_close"))
+            ):
+                update["close_bid"] = row.get("close") - row.get("spread_close") / 2
+            if (
+                "close_ask" in frame.columns
+                and pd.isna(row.get("close_ask"))
+                and not pd.isna(row.get("close"))
+                and not pd.isna(row.get("spread_close"))
+            ):
+                update["close_ask"] = row.get("close") + row.get("spread_close") / 2
+            if (
+                "close" in frame.columns
+                and pd.isna(row.get("close"))
+                and not pd.isna(row.get("close_bid"))
+                and not pd.isna(row.get("close_ask"))
+            ):
+                update["close"] = (row.get("close_bid") + row.get("close_ask")) / 2
 
-        for group in groups:
-            group_ts = sorted(group)
-            start = group_ts[0]
-            end = group_ts[-1]
-            skipped_flags: List[str] = []
-            eligible_ts: List[pd.Timestamp] = []
-            for ts in group_ts:
-                dt_value = ts.to_pydatetime()
-                flag = self.db.get_flag(cfg.table, asset_id, dt_value)
-                if flag and flag.get("failure_count", 0) >= 3:
-                    skipped_flags.append(ts.isoformat())
-                    continue
-                eligible_ts.append(ts)
-            if not eligible_ts:
-                actions.append(
-                    {
-                        "asset_id": asset_id,
-                        "rango": (start.isoformat(), end.isoformat()),
-                        "skipped_flags": skipped_flags,
-                        "resultado": "omitido",
-                    }
-                )
-                continue
+            if update:
+                for key, value in update.items():
+                    frame.at[ts, key] = value
+                updates.append((asset_id, ts, update))
+        if not updates:
+            return 0
 
-            fields_needed = self._fields_needed(cfg, asset_report, eligible_ts, derived_fields)
-            fetched, source_detail = self._fetch_range(
-                cfg, symbol, epic, eligible_ts, start, end, fields_needed
-            )
-            normalized = self._normalize_records(cfg, fetched)
-            filtered_records = [rec for rec in normalized if pd.Timestamp(rec["timestamp"]) in set(eligible_ts)]
-            validated = [rec for rec in filtered_records if self._validate_row(cfg, rec)]
-            if not validated:
-                error_msg = "Sin datos válidos para el rango"
-                for ts in eligible_ts:
-                    self.db.upsert_flag(cfg.table, asset_id, ts.to_pydatetime(), error_msg)
-                actions.append(
-                    {
-                        "asset_id": asset_id,
-                        "rango": (start.isoformat(), end.isoformat()),
-                        "error": error_msg,
-                        "source": self._select_source(cfg),
-                        "source_detail": source_detail,
-                        "campos_solicitados": sorted(fields_needed),
-                        "solicitudes": len(fetched),
-                        "skipped_flags": skipped_flags,
-                        "resultado": "sin_datos",
-                    }
-                )
-                continue
+        for asset_id_value, ts_value, update in updates:
+            self._apply_update(table_cfg, asset_id_value, ts_value, update)
+        self.log.info(
+            "Tabla %s asset %s: %d campos derivados",
+            table_cfg.table,
+            asset_id,
+            len(updates),
+        )
+        return len(updates)
 
-            columns, rows = self._prepare_insert_rows(cfg, asset_id, validated)
+    def _apply_update(
+        self, table_cfg: TableConfig, asset_id: Any, ts: dt.datetime, update: Dict[str, Any]
+    ) -> None:
+        set_clause = ", ".join(f"{col} = %s" for col in update.keys())
+        values = list(update.values())
+        values.extend([asset_id, ts])
+        sql = (
+            f"UPDATE {self.cfg.schema}.{table_cfg.table} "
+            f"SET {set_clause} "
+            f"WHERE {table_cfg.asset_column} = %s AND {table_cfg.datetime_column} = %s"
+        )
+        self.db.execute(sql, values)
+
+
+class Refiller:
+    def __init__(self, db: Database, cfg: AppConfig, assets: AssetResolver):
+        self.db = db
+        self.cfg = cfg
+        self.assets = assets
+        self.log = logging.getLogger("completitud.refill")
+        self.session = requests.Session()
+        self.flags_path = cfg.output_dir / "refill_flags.json"
+        self.flags: Dict[str, int] = {}
+        self._load_flags()
+
+    def _load_flags(self) -> None:
+        if self.flags_path.exists():
             try:
-                self.db.insert_rows(cfg.table, columns, rows, cfg.conflict_columns or [cfg.asset_column, cfg.datetime_column])
-                for ts in eligible_ts:
-                    self.db.clear_flag(cfg.table, asset_id, ts.to_pydatetime())
-                actions.append(
-                    {
-                        "asset_id": asset_id,
-                        "rango": (start.isoformat(), end.isoformat()),
-                        "insertados": len(validated),
-                        "source": self._select_source(cfg),
-                        "source_detail": source_detail,
-                        "campos_solicitados": sorted(fields_needed),
-                        "skipped_flags": skipped_flags,
-                        "resultado": "actualizado",
-                    }
-                )
-            except Exception as exc:
-                error_msg = str(exc)
-                for ts in eligible_ts:
-                    self.db.upsert_flag(cfg.table, asset_id, ts.to_pydatetime(), error_msg)
-                actions.append(
-                    {
-                        "asset_id": asset_id,
-                        "rango": (start.isoformat(), end.isoformat()),
-                        "error": error_msg,
-                        "source": self._select_source(cfg),
-                        "source_detail": source_detail,
-                        "campos_solicitados": sorted(fields_needed),
-                        "skipped_flags": skipped_flags,
-                        "resultado": "error",
-                    }
-                )
+                self.flags = json.loads(self.flags_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                self.flags = {}
+
+    def _persist_flags(self) -> None:
+        self.cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        self.flags_path.write_text(json.dumps(self.flags, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _flag_key(self, table: str, asset: Any, ts: str) -> str:
+        return f"{table}:{asset}:{ts}"
+
+    def should_skip(self, table: str, asset: Any, ts: str) -> bool:
+        key = self._flag_key(table, asset, ts)
+        return self.flags.get(key, 0) >= self.cfg.max_refill_attempts
+
+    def mark_failure(self, table: str, asset: Any, ts: str) -> None:
+        key = self._flag_key(table, asset, ts)
+        self.flags[key] = self.flags.get(key, 0) + 1
+        self._persist_flags()
+
+    def clear_flag(self, table: str, asset: Any, ts: str) -> None:
+        key = self._flag_key(table, asset, ts)
+        if key in self.flags:
+            del self.flags[key]
+            self._persist_flags()
+
+    def refill(self, analysis: GapAnalysisResult) -> Dict[str, Any]:
+        actions: Dict[str, Any] = {}
+        for table_cfg in self.cfg.timeseries_tables:
+            table_actions: Dict[str, Any] = {}
+            table_assets = analysis.tables.get(table_cfg.table, {})
+            for asset_id, payload in table_assets.items():
+                missing_dates = payload.get("missing_dates", [])
+                field_gaps = payload.get("field_gaps", {})
+                recovered = []
+                if missing_dates:
+                    recovered.extend(
+                        self._refill_missing_rows(table_cfg, asset_id, missing_dates)
+                    )
+                if field_gaps:
+                    recovered.extend(
+                        self._refill_missing_fields(table_cfg, asset_id, field_gaps)
+                    )
+                if recovered:
+                    table_actions[str(asset_id)] = recovered
+            if table_actions:
+                actions[table_cfg.table] = table_actions
         return actions
 
-    def _normalize_for_cfg(self, cfg: TimeseriesTableConfig, ts: Any) -> Optional[pd.Timestamp]:
-        cache = self._normalize_cache.setdefault(cfg.table, {})
-
-        def _cache_key(value: Any) -> Any:
-            if isinstance(value, pd.Timestamp):
-                return (value.value, self._tz_identifier(value.tzinfo))
-            if isinstance(value, dt.datetime):
-                ts_val = pd.Timestamp(value)
-                return (ts_val.value, self._tz_identifier(ts_val.tzinfo))
-            return value
-
-        key = _cache_key(ts)
-        if key in cache:
-            return cache[key]
-
-        parsed = self._parse_timestamp(cfg, ts)
-        if parsed is None:
-            cache[key] = None
-            return None
-
-        normalized = parsed.normalize() if cfg.frequency == "daily" else parsed
-        cache[key] = normalized
-
-        if len(cache) > 10000:
-            cache.clear()
-
-        return normalized
-
-    def _attempt_derivations(
-        self,
-        cfg: TimeseriesTableConfig,
-        asset_id: Any,
-        asset_report: Dict[str, Any],
-    ) -> Tuple[Set[pd.Timestamp], List[Dict[str, Any]], Dict[pd.Timestamp, Set[str]]]:
-        resolved: Set[pd.Timestamp] = set()
-        actions: List[Dict[str, Any]] = []
-        derived_fields: Dict[pd.Timestamp, Set[str]] = {}
-        processed: Set[pd.Timestamp] = set()
-
-        issues = (asset_report.get("missing_rows", []) or []) + (asset_report.get("invalid_rows", []) or [])
-        for issue in issues:
-            ts_raw = issue.get("timestamp")
-            if not ts_raw:
+    def _refill_missing_rows(
+        self, table_cfg: TableConfig, asset_id: Any, missing_dates: Sequence[str]
+    ) -> List[str]:
+        asset_meta = self.assets.get(asset_id)
+        if not asset_meta:
+            self.log.warning("Activo %s sin metadatos, no se rellena", asset_id)
+            return []
+        recovered: List[str] = []
+        for iso_ts in missing_dates:
+            if self.should_skip(table_cfg.table, asset_id, iso_ts):
+                self.log.info(
+                    "Saltando %s %s %s por exceder reintentos",
+                    table_cfg.table,
+                    asset_id,
+                    iso_ts,
+                )
                 continue
-            ts = self._parse_timestamp(cfg, ts_raw)
-            if ts is None:
+            try:
+                row = self._fetch_remote_row(table_cfg, asset_meta, iso_ts)
+            except Exception as exc:
+                self.log.error(
+                    "Error obteniendo %s %s en %s: %s",
+                    table_cfg.table,
+                    asset_id,
+                    iso_ts,
+                    exc,
+                )
+                self.mark_failure(table_cfg.table, asset_id, iso_ts)
                 continue
-            ts_key = self._normalize_for_cfg(cfg, ts)
-            if ts_key is None or ts_key in processed:
-                continue
-            processed.add(ts_key)
-            dt_value = ts.to_pydatetime()
-            row = self.db.fetch_row(cfg.table, cfg.asset_column, asset_id, cfg.datetime_column, dt_value)
             if not row:
+                self.log.warning(
+                    "No se recibió dato remoto para %s %s en %s",
+                    table_cfg.table,
+                    asset_id,
+                    iso_ts,
+                )
+                self.mark_failure(table_cfg.table, asset_id, iso_ts)
                 continue
-            updates = self._derive_row_values(row)
-            if updates:
-                try:
-                    updated = self.db.update_row(
-                        cfg.table,
-                        cfg.asset_column,
-                        asset_id,
-                        cfg.datetime_column,
-                        dt_value,
-                        updates,
-                    )
-                except Exception as exc:  # pragma: no cover - errores inesperados
-                    actions.append(
-                        {
-                            "asset_id": asset_id,
-                            "timestamp": ts.isoformat(),
-                            "resultado": "error_derivacion",
-                            "error": str(exc),
-                            "campos": list(updates.keys()),
-                            "source": "derivacion_local",
-                            "source_detail": {"metodo": "derivacion_local"},
-                        }
-                    )
-                    continue
-                if updated:
-                    actions.append(
-                        {
-                            "asset_id": asset_id,
-                            "timestamp": ts.isoformat(),
-                            "resultado": "derivado",
-                            "metodo": "calculo_local",
-                            "campos": {key: updates[key] for key in updates},
-                            "source": "derivacion_local",
-                            "source_detail": {"metodo": "derivacion_local"},
-                        }
-                    )
-                    derived_fields.setdefault(ts_key, set()).update(updates.keys())
-                    row.update(updates)
-            if self._row_is_complete(cfg, row):
-                resolved.add(ts_key)
-        return resolved, actions, derived_fields
+            self._insert_row(table_cfg, asset_id, iso_ts, row)
+            recovered.append(f"row:{iso_ts}")
+            self.clear_flag(table_cfg.table, asset_id, iso_ts)
+        return recovered
 
-    def _derive_row_values(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        updates: Dict[str, Any] = {}
+    def _refill_missing_fields(
+        self, table_cfg: TableConfig, asset_id: Any, field_gaps: Dict[str, int]
+    ) -> List[str]:
+        recovered: List[str] = []
+        for field in field_gaps:
+            try:
+                count = self._refill_field(table_cfg, asset_id, field)
+            except Exception as exc:
+                self.log.error(
+                    "Error rellenando campo %s.%s para asset %s: %s",
+                    table_cfg.table,
+                    field,
+                    asset_id,
+                    exc,
+                )
+                continue
+            if count:
+                recovered.append(f"field:{field}:{count}")
+        return recovered
 
-        def needs(field: str) -> bool:
-            return field in row and is_missing_value(row.get(field))
+    def _insert_row(
+        self, table_cfg: TableConfig, asset_id: Any, iso_ts: str, values: Dict[str, Any]
+    ) -> None:
+        timestamp = dt.datetime.fromisoformat(iso_ts)
+        values.setdefault(table_cfg.asset_column, asset_id)
+        values.setdefault(table_cfg.datetime_column, timestamp)
+        columns = [table_cfg.asset_column, table_cfg.datetime_column]
+        params = [asset_id, timestamp]
+        for field, value in values.items():
+            if field in columns:
+                continue
+            columns.append(field)
+            params.append(value)
+        placeholders = ", ".join(["%s"] * len(columns))
+        conflict_cols = {table_cfg.asset_column, table_cfg.datetime_column}
+        update_cols = [col for col in columns if col not in conflict_cols]
+        if update_cols:
+            update_clause = ", ".join(f"{col} = EXCLUDED.{col}" for col in update_cols)
+            on_conflict = (
+                f"ON CONFLICT ({table_cfg.asset_column}, {table_cfg.datetime_column}) DO UPDATE SET "
+                f"{update_clause}"
+            )
+        else:
+            on_conflict = f"ON CONFLICT ({table_cfg.asset_column}, {table_cfg.datetime_column}) DO NOTHING"
+        sql = (
+            f"INSERT INTO {self.cfg.schema}.{table_cfg.table} ({', '.join(columns)}) "
+            f"VALUES ({placeholders}) "
+            f"{on_conflict}"
+        )
+        self.db.execute(sql, params)
 
-        def has(field: str) -> bool:
-            return field in row and not is_missing_value(row.get(field))
-
-        changed = True
-        while changed:
-            changed = False
-
-            if needs("divadj_open") and has("divadj_close") and has("open") and has("close"):
-                close_px = as_float(row.get("close"))
-                open_px = as_float(row.get("open"))
-                div_close = as_float(row.get("divadj_close"))
-                if close_px not in (None, 0) and open_px is not None and div_close is not None:
-                    factor = div_close / close_px if close_px else None
-                    if factor is not None:
-                        value = open_px * factor
-                        row["divadj_open"] = value
-                        updates["divadj_open"] = value
-                        changed = True
-
-            if needs("divadj_high") and has("divadj_close") and has("high") and has("close"):
-                close_px = as_float(row.get("close"))
-                high_px = as_float(row.get("high"))
-                div_close = as_float(row.get("divadj_close"))
-                if close_px not in (None, 0) and high_px is not None and div_close is not None:
-                    factor = div_close / close_px if close_px else None
-                    if factor is not None:
-                        value = high_px * factor
-                        row["divadj_high"] = value
-                        updates["divadj_high"] = value
-                        changed = True
-
-            if needs("divadj_low") and has("divadj_close") and has("low") and has("close"):
-                close_px = as_float(row.get("close"))
-                low_px = as_float(row.get("low"))
-                div_close = as_float(row.get("divadj_close"))
-                if close_px not in (None, 0) and low_px is not None and div_close is not None:
-                    factor = div_close / close_px if close_px else None
-                    if factor is not None:
-                        value = low_px * factor
-                        row["divadj_low"] = value
-                        updates["divadj_low"] = value
-                        changed = True
-
-            if (needs("change") or needs("change_percent")) and has("open") and has("close"):
-                open_px = as_float(row.get("open"))
-                close_px = as_float(row.get("close"))
-                if open_px is not None and close_px is not None:
-                    change_val = close_px - open_px
-                    if needs("change"):
-                        row["change"] = change_val
-                        updates["change"] = change_val
-                        changed = True
-                    if needs("change_percent") and open_px != 0:
-                        change_pct = (change_val / open_px) * 100.0
-                        row["change_percent"] = change_pct
-                        updates["change_percent"] = change_pct
-                        changed = True
-
-            if needs("ts_epoch") and ("fecha" in row or "timestamp" in row):
-                fecha_val = row.get("fecha") or row.get("timestamp")
-                try:
-                    ts_val = pd.Timestamp(fecha_val)
-                except Exception:
-                    ts_val = None
-                if ts_val is not None:
-                    epoch_val = int(ts_val.timestamp())
-                    row["ts_epoch"] = epoch_val
-                    updates["ts_epoch"] = epoch_val
-                    changed = True
-
-            if needs("spread_open") and has("open_bid") and has("open_ask"):
-                bid = as_float(row.get("open_bid"))
-                ask = as_float(row.get("open_ask"))
-                if bid is not None and ask is not None:
-                    spread = ask - bid
-                    row["spread_open"] = spread
-                    updates["spread_open"] = spread
-                    changed = True
-
-            if needs("spread_close") and has("close_bid") and has("close_ask"):
-                bid = as_float(row.get("close_bid"))
-                ask = as_float(row.get("close_ask"))
-                if bid is not None and ask is not None:
-                    spread = ask - bid
-                    row["spread_close"] = spread
-                    updates["spread_close"] = spread
-                    changed = True
-
-            if needs("open_bid") and has("open") and has("spread_open"):
-                open_px = as_float(row.get("open"))
-                spread = as_float(row.get("spread_open"))
-                if open_px is not None and spread is not None:
-                    bid = open_px - spread / 2.0
-                    row["open_bid"] = bid
-                    updates["open_bid"] = bid
-                    changed = True
-
-            if needs("close_bid") and has("close") and has("spread_close"):
-                close_px = as_float(row.get("close"))
-                spread = as_float(row.get("spread_close"))
-                if close_px is not None and spread is not None:
-                    bid = close_px - spread / 2.0
-                    row["close_bid"] = bid
-                    updates["close_bid"] = bid
-                    changed = True
-
-            if needs("open_ask") and has("open") and has("spread_open"):
-                open_px = as_float(row.get("open"))
-                spread = as_float(row.get("spread_open"))
-                if open_px is not None and spread is not None:
-                    ask = open_px + spread / 2.0
-                    row["open_ask"] = ask
-                    updates["open_ask"] = ask
-                    changed = True
-
-            if needs("open") and has("open_bid") and has("open_ask"):
-                bid = as_float(row.get("open_bid"))
-                ask = as_float(row.get("open_ask"))
-                if bid is not None and ask is not None:
-                    open_px = (bid + ask) / 2.0
-                    row["open"] = open_px
-                    updates["open"] = open_px
-                    changed = True
-
-            if needs("close_ask") and has("close") and has("spread_close"):
-                close_px = as_float(row.get("close"))
-                spread = as_float(row.get("spread_close"))
-                if close_px is not None and spread is not None:
-                    ask = close_px + spread / 2.0
-                    row["close_ask"] = ask
-                    updates["close_ask"] = ask
-                    changed = True
-
-            if needs("close") and has("close_bid") and has("close_ask"):
-                bid = as_float(row.get("close_bid"))
-                ask = as_float(row.get("close_ask"))
-                if bid is not None and ask is not None:
-                    close_px = (bid + ask) / 2.0
-                    row["close"] = close_px
-                    updates["close"] = close_px
-                    changed = True
-
+    def _refill_field(self, table_cfg: TableConfig, asset_id: Any, field: str) -> int:
+        asset_meta = self.assets.get(asset_id)
+        if not asset_meta:
+            self.log.warning("Sin metadatos para %s al rellenar %s", asset_id, field)
+            return 0
+        sql = (
+            f"SELECT {table_cfg.datetime_column} FROM {self.cfg.schema}.{table_cfg.table} "
+            f"WHERE {table_cfg.asset_column} = %s AND ({field} IS NULL OR {field} = 0)"
+        )
+        rows = self.db.fetchall(sql, (asset_id,))
+        updates = 0
+        for row in rows:
+            ts = row[table_cfg.datetime_column]
+            iso_ts = normalize_datetime(ts, table_cfg.timezone).isoformat()
+            if self.should_skip(table_cfg.table, asset_id, f"{field}:{iso_ts}"):
+                continue
+            try:
+                remote = self._fetch_remote_row(table_cfg, asset_meta, iso_ts)
+            except Exception as exc:
+                self.log.error(
+                    "Error remoto para campo %s en %s %s: %s",
+                    field,
+                    table_cfg.table,
+                    asset_id,
+                    exc,
+                )
+                self.mark_failure(table_cfg.table, asset_id, f"{field}:{iso_ts}")
+                continue
+            if remote and field in remote:
+                sql_update = (
+                    f"UPDATE {self.cfg.schema}.{table_cfg.table} SET {field} = %s "
+                    f"WHERE {table_cfg.asset_column} = %s AND {table_cfg.datetime_column} = %s"
+                )
+                self.db.execute(sql_update, (remote[field], asset_id, ts))
+                updates += 1
+                self.clear_flag(table_cfg.table, asset_id, f"{field}:{iso_ts}")
         return updates
 
-    def _row_is_complete(self, cfg: TimeseriesTableConfig, row: Dict[str, Any]) -> bool:
-        for column in cfg.data_columns:
-            if column not in row:
-                continue
-            value = row.get(column)
-            if is_missing_value(value):
-                return False
-            if column in NUMERIC_COLUMNS:
-                numeric_val = as_float(value)
-                if numeric_val is None:
-                    return False
-                if column == "volume" and numeric_val < 0:
-                    return False
-            if column in INTEGER_COLUMNS:
-                val = row.get(column)
-                if val is None:
-                    return False
-                if isinstance(val, float) and math.isnan(val):
-                    return False
-                if isinstance(val, Decimal):
-                    try:
-                        float(val)
-                    except (TypeError, ValueError):
-                        return False
-                if isinstance(val, float):
-                    continue
-                if isinstance(val, Decimal):
-                    continue
-                if not isinstance(val, int):
-                    return False
-
-        open_px = as_float(row.get("open")) if "open" in row else None
-        high_px = as_float(row.get("high")) if "high" in row else None
-        low_px = as_float(row.get("low")) if "low" in row else None
-        close_px = as_float(row.get("close")) if "close" in row else None
-
-        if open_px is not None and high_px is not None and open_px > high_px + 1e-9:
-            return False
-        if close_px is not None and high_px is not None and close_px > high_px + 1e-9:
-            return False
-        if low_px is not None and open_px is not None and low_px > open_px + 1e-9:
-            return False
-        if low_px is not None and close_px is not None and low_px > close_px + 1e-9:
-            return False
-        if high_px is not None and low_px is not None and high_px < low_px:
-            return False
-        if "volume" in row:
-            volume_val = as_float(row.get("volume"))
-            if volume_val is not None and volume_val < 0:
-                return False
-        return True
-
-    def _fields_needed(
-        self,
-        cfg: TimeseriesTableConfig,
-        asset_report: Dict[str, Any],
-        timestamps: List[pd.Timestamp],
-        derived_fields: Dict[pd.Timestamp, Set[str]],
-    ) -> Set[str]:
-        needed: Set[str] = set()
-        ts_set: Set[pd.Timestamp] = set()
-        for ts in timestamps:
-            normalized = self._normalize_for_cfg(cfg, ts)
-            if normalized is not None:
-                ts_set.add(normalized)
-
-        for row_issue in asset_report.get("missing_rows", []) or []:
-            ts_raw = row_issue.get("timestamp")
-            if not ts_raw:
-                continue
-            ts = self._parse_timestamp(cfg, ts_raw)
-            if ts is None:
-                continue
-            ts_key = self._normalize_for_cfg(cfg, ts)
-            if ts_key is None or ts_key not in ts_set:
-                continue
-            row_data = row_issue.get("row") or {}
-            for column in cfg.data_columns:
-                if column not in row_data:
-                    continue
-                if column in derived_fields.get(ts_key, set()):
-                    continue
-                value = row_data.get(column)
-                if is_missing_value(value) or (column in NUMERIC_COLUMNS and as_float(value) is None):
-                    needed.add(column)
-
-        for row_issue in asset_report.get("invalid_rows", []) or []:
-            ts_raw = row_issue.get("timestamp")
-            if not ts_raw:
-                continue
-            ts = self._parse_timestamp(cfg, ts_raw)
-            if ts is None:
-                continue
-            ts_key = self._normalize_for_cfg(cfg, ts)
-            if ts_key is not None and ts_key in ts_set:
-                needed.update(cfg.data_columns)
-
-        for ts_raw in asset_report.get("missing_dates", []) or []:
-            ts = self._parse_timestamp(cfg, ts_raw)
-            if ts is None:
-                continue
-            ts_key = self._normalize_for_cfg(cfg, ts)
-            if ts_key is not None and ts_key in ts_set:
-                needed.update(cfg.data_columns)
-
-        if not needed:
-            needed.update(cfg.data_columns)
-        return needed
-
-    def _build_source_detail(
-        self,
-        cfg: TimeseriesTableConfig,
-        fields_needed: Set[str],
-        interval_minutes: Optional[int] = None,
-        fallback_used: bool = False,
+    def _fetch_remote_row(
+        self, table_cfg: TableConfig, asset_meta: Optional[Dict[str, Any]], iso_ts: str
     ) -> Dict[str, Any]:
-        source = self._select_source(cfg)
-        fields_sorted = sorted(fields_needed)
-        endpoint = self._resolve_endpoint(cfg, source, interval_minutes)
-        detail: Dict[str, Any] = {
-            "provider": self._provider_label(source),
-            "requested_fields": fields_sorted,
-            "field_map": self._resolve_field_map(cfg, source, fields_sorted),
+        if table_cfg.provider == "capital":
+            return self._fetch_capital(table_cfg, asset_meta, iso_ts)
+        if table_cfg.provider == "fmp":
+            return self._fetch_fmp(table_cfg, asset_meta, iso_ts)
+        if table_cfg.provider == "yfinance":
+            return self._fetch_yfinance(table_cfg, asset_meta, iso_ts)
+        raise ValueError(f"Proveedor desconocido: {table_cfg.provider}")
+
+    def _fetch_capital(
+        self, table_cfg: TableConfig, asset_meta: Optional[Dict[str, Any]], iso_ts: str
+    ) -> Dict[str, Any]:
+        if not self.cfg.capital_api_key or not self.cfg.capital_api_url:
+            raise RuntimeError("Capital.com no configurado")
+        symbol = (asset_meta or {}).get("symbol")
+        if not symbol:
+            raise RuntimeError("Activo sin símbolo para Capital.com")
+        endpoint = table_cfg.endpoint or f"/prices/{symbol}"
+        url = self.cfg.capital_api_url.rstrip("/") + endpoint
+        params = {
+            "from": iso_ts,
+            "to": iso_ts,
+            "max": 1,
         }
-        if endpoint:
-            detail["endpoint"] = endpoint
-        if source == "fmp" and fallback_used and HAS_YFINANCE:
-            detail["fallback"] = {
-                "provider": self._provider_label("yfinance"),
-                "endpoint": "yfinance.download",
-                "field_map": {field: YF_FIELD_MAP.get(field, field) for field in fields_sorted},
-            }
-        return detail
+        headers = {"X-API-KEY": self.cfg.capital_api_key}
+        response = self.session.get(url, params=params, headers=headers, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        if not data:
+            return {}
+        record = data[0] if isinstance(data, list) else data.get("prices", [{}])[0]
+        mapped = map_remote_record(record, table_cfg.field_map or CAPITAL_DEFAULT_FIELD_MAP)
+        return self._normalise_remote_record(mapped)
 
-    def _select_source(self, cfg: TimeseriesTableConfig) -> str:
-        if cfg.provider:
-            return cfg.provider
-        if cfg.table.endswith("_cfd"):
-            return "capital"
-        return "fmp"
+    def _fetch_fmp(
+        self, table_cfg: TableConfig, asset_meta: Optional[Dict[str, Any]], iso_ts: str
+    ) -> Dict[str, Any]:
+        if not self.cfg.fmp_api_key:
+            raise RuntimeError("FMP API key no configurada")
+        symbol = (asset_meta or {}).get("symbol")
+        if not symbol:
+            raise RuntimeError("Activo sin símbolo para FMP")
+        base = self.cfg.fmp_api_url.rstrip("/")
+        if table_cfg.frequency == "daily":
+            endpoint = f"/historical-price-full/{symbol}"
+            params = {"from": iso_ts[:10], "to": iso_ts[:10], "apikey": self.cfg.fmp_api_key}
+        else:
+            interval = table_cfg.interval_minutes or 5
+            endpoint = f"/historical-chart/{interval}min/{symbol}"
+            params = {"from": iso_ts, "to": iso_ts, "apikey": self.cfg.fmp_api_key}
+        url = base + endpoint
+        response = self.session.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+        if not payload:
+            return {}
+        if "historical" in payload:
+            records = payload["historical"]
+        else:
+            records = payload
+        if not records:
+            return {}
+        record = records[0]
+        field_map = table_cfg.field_map or (
+            FMP_DAILY_FIELD_MAP if table_cfg.frequency == "daily" else FMP_INTRADAY_FIELD_MAP
+        )
+        mapped = map_remote_record(record, field_map)
+        return self._normalise_remote_record(mapped)
 
-    def _fetch_range(
-        self,
-        cfg: TimeseriesTableConfig,
-        symbol: Optional[str],
-        epic: Optional[str],
-        timestamps: List[pd.Timestamp],
-        start: pd.Timestamp,
-        end: pd.Timestamp,
-        fields_needed: Set[str],
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        source = self._select_source(cfg)
-        interval_value = cfg.interval_minutes or 1
-        start_ts = self._parse_timestamp(cfg, start)
-        end_ts = self._parse_timestamp(cfg, end)
-        if start_ts is None or end_ts is None:
-            return [], self._build_source_detail(cfg, fields_needed, interval_minutes=interval_value)
-        if source == "capital":
-            if not epic:
-                self.logger.warning("No se dispone de epic para %s en %s", symbol, cfg.table)
-                return [], self._build_source_detail(cfg, fields_needed, interval_minutes=interval_value)
-            resolution = "DAY" if cfg.frequency == "daily" else f"MINUTE_{interval_value}"
-            records = self.capital.fetch_prices(
-                epic,
-                self._to_utc_datetime(start_ts),
-                self._to_utc_datetime(end_ts),
-                resolution,
+    def _fetch_yfinance(
+        self, table_cfg: TableConfig, asset_meta: Optional[Dict[str, Any]], iso_ts: str
+    ) -> Dict[str, Any]:
+        if not self.cfg.yfinance_enabled or not HAS_YFINANCE:
+            raise RuntimeError("yfinance no disponible")
+        symbol = (asset_meta or {}).get("symbol")
+        if not symbol:
+            raise RuntimeError("Activo sin símbolo para Yahoo Finance")
+        ticker = yf.Ticker(symbol)
+        if table_cfg.frequency == "daily":
+            day = dt.date.fromisoformat(iso_ts[:10])
+            end_day = day + dt.timedelta(days=1)
+            history = ticker.history(start=day.isoformat(), end=end_day.isoformat())
+        else:
+            dt_from = dt.datetime.fromisoformat(iso_ts)
+            dt_to = dt_from + dt.timedelta(minutes=table_cfg.interval_minutes or 5)
+            history = ticker.history(
+                interval=f"{table_cfg.interval_minutes or 5}m",
+                start=dt_from.isoformat(),
+                end=dt_to.isoformat(),
             )
-            return records, self._build_source_detail(cfg, fields_needed, interval_minutes=interval_value)
-        if source == "fmp":
-            if not symbol:
-                self.logger.warning("No se dispone de símbolo para activo %s en %s", timestamps, cfg.table)
-                return [], self._build_source_detail(cfg, fields_needed, interval_minutes=interval_value)
-            fallback_used = False
-            if cfg.frequency == "daily":
-                records = self.fmp.fetch_daily(symbol, start_ts.date(), end_ts.date())
+        if history.empty:
+            return {}
+        row = history.iloc[0]
+        record = {key: row.get(remote) for key, remote in YFINANCE_FIELD_MAP.items()}
+        return self._normalise_remote_record(record)
+
+    def _normalise_remote_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        normalised: Dict[str, Any] = {}
+        for key, value in record.items():
+            if isinstance(value, str):
+                value = value.strip()
+            if isinstance(value, Decimal):
+                value = float(value)
+            if key in NUMERIC_FIELDS and isinstance(value, str):
+                try:
+                    normalised[key] = float(value)
+                except ValueError:
+                    continue
+            elif key in INTEGER_FIELDS and value is not None:
+                normalised[key] = int(value)
             else:
-                records = self.fmp.fetch_intraday(
-                    symbol,
-                    interval_value,
-                    self._to_utc_datetime(start_ts),
-                    self._to_utc_datetime(end_ts),
-                )
-            if not records and HAS_YFINANCE:
-                if cfg.frequency == "daily":
-                    yf_records = self.yf_client.fetch(
-                        symbol,
-                        self._to_utc_datetime(start_ts),
-                        self._to_utc_datetime(end_ts),
-                        interval="1d",
-                    )
-                else:
-                    interval = "1m" if interval_value <= 1 else f"{interval_value}m"
-                    yf_records = self.yf_client.fetch(
-                        symbol,
-                        self._to_utc_datetime(start_ts),
-                        self._to_utc_datetime(end_ts),
-                        interval=interval,
-                    )
-                if yf_records:
-                    records.extend(yf_records)
-                    fallback_used = True
-            detail = self._build_source_detail(
-                cfg,
-                fields_needed,
-                interval_minutes=interval_value,
-                fallback_used=fallback_used,
-            )
-            return records, detail
-        return [], self._build_source_detail(cfg, fields_needed, interval_minutes=interval_value)
+                normalised[key] = value
+        if "open_bid" in normalised and "open_ask" in normalised and "spread_open" not in normalised:
+            try:
+                normalised["spread_open"] = normalised["open_ask"] - normalised["open_bid"]
+            except TypeError:
+                pass
+        if "close_bid" in normalised and "close_ask" in normalised and "spread_close" not in normalised:
+            try:
+                normalised["spread_close"] = normalised["close_ask"] - normalised["close_bid"]
+            except TypeError:
+                pass
+        return normalised
 
-    def _normalize_records(self, cfg: TimeseriesTableConfig, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        normalized: List[Dict[str, Any]] = []
-        for rec in records:
-            norm = self._normalize_record(cfg, rec)
-            if norm:
-                normalized.append(norm)
-        return normalized
 
-    def _normalize_record(self, cfg: TimeseriesTableConfig, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if "snapshotTimeUTC" in rec or "snapshotTime" in rec:
-            timestamp = rec.get("snapshotTimeUTC") or rec.get("snapshotTime")
-            ts = self._parse_timestamp(cfg, timestamp)
-            if ts is None:
-                return None
-            def pick_price(node: Any) -> Optional[float]:
-                if isinstance(node, (int, float)):
-                    return float(node)
-                if isinstance(node, dict):
-                    for key in ("mid", "lastTraded", "value", "bid", "ask"):
-                        val = node.get(key)
-                        if val is not None:
-                            try:
-                                return float(val)
-                            except (TypeError, ValueError):
-                                continue
-                return None
-            norm = {
-                "timestamp": ts,
-                "open": pick_price(rec.get("openPrice")),
-                "high": pick_price(rec.get("highPrice")),
-                "low": pick_price(rec.get("lowPrice")),
-                "close": pick_price(rec.get("closePrice")),
-                "volume": as_float(rec.get("lastTradedVolume")),
-            }
-            return norm
-        if "date" in rec:
-            ts = self._parse_timestamp(cfg, rec.get("date"))
-            if ts is None:
-                return None
-            norm = {
-                "timestamp": ts,
-                "open": as_float(rec.get("open")),
-                "high": as_float(rec.get("high")),
-                "low": as_float(rec.get("low")),
-                "close": as_float(rec.get("close")),
-                "volume": as_float(rec.get("volume")),
-            }
-            return norm
-        if "timestamp" in rec:
-            ts = self._parse_timestamp(cfg, rec.get("timestamp"))
-            if ts is None:
-                return None
-            norm = {
-                "timestamp": ts,
-                "open": as_float(rec.get("open")),
-                "high": as_float(rec.get("high")),
-                "low": as_float(rec.get("low")),
-                "close": as_float(rec.get("close")),
-                "volume": as_float(rec.get("volume")),
-            }
-            return norm
-        return None
+class AuditTrail:
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+        self.log = logging.getLogger("completitud.audit")
 
-    def _prepare_insert_rows(
-        self, cfg: TimeseriesTableConfig, asset_id: Any, records: List[Dict[str, Any]]
-    ) -> Tuple[Sequence[str], List[Sequence[Any]]]:
-        columns = [cfg.asset_column, cfg.datetime_column] + cfg.data_columns
-        rows: List[Sequence[Any]] = []
-        for rec in records:
-            timestamp = pd.Timestamp(rec["timestamp"]).to_pydatetime()
-            row = [asset_id, timestamp]
-            for col in cfg.data_columns:
-                row.append(rec.get(col))
-            rows.append(row)
-        return columns, rows
-
-    def _validate_row(self, cfg: TimeseriesTableConfig, rec: Dict[str, Any]) -> bool:
-        open_px = rec.get("open")
-        high_px = rec.get("high")
-        low_px = rec.get("low")
-        close_px = rec.get("close")
-        volume = rec.get("volume")
-        for key, value in (("open", open_px), ("high", high_px), ("low", low_px), ("close", close_px)):
-            if value is None:
-                return False
-            if not isinstance(value, (int, float)):
-                return False
-            if value < 0:
-                return False
-            if cfg.price_floor is not None and value < cfg.price_floor:
-                return False
-            if cfg.price_ceiling is not None and value > cfg.price_ceiling:
-                return False
-        if volume is None or (isinstance(volume, (int, float)) and volume < 0):
-            return False
-        if open_px is not None and high_px is not None and open_px > high_px + 1e-9:
-            return False
-        if close_px is not None and high_px is not None and close_px > high_px + 1e-9:
-            return False
-        if low_px is not None and open_px is not None and low_px > open_px + 1e-9:
-            return False
-        if low_px is not None and close_px is not None and low_px > close_px + 1e-9:
-            return False
-        if high_px is not None and low_px is not None and high_px < low_px:
-            return False
-        return True
-
-    def compute_gap_stats(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
-        totals = {
-            "rows": 0,
-            "issues": 0,
-        }
-        per_table: Dict[str, Any] = {}
-        for table_cfg in self.cfg.tables:
-            table_data = analysis.get(table_cfg.table, {})
-            assets = table_data.get("assets", {}) if isinstance(table_data, dict) else {}
-            table_rows = 0
-            table_issues = 0
-            asset_stats: Dict[str, Any] = {}
-            for asset_id, asset_report in assets.items():
-                stats = asset_report.get("stats", {})
-                rows = stats.get("rows", 0)
-                missing_rows = stats.get("missing_field_rows", 0)
-                invalid_rows = stats.get("invalid_rows", 0)
-                missing_dates = len(asset_report.get("missing_dates", []))
-                total_rows = rows + missing_dates
-                issue_rows = missing_rows + invalid_rows + missing_dates
-                pct = float(issue_rows) / total_rows * 100 if total_rows else 0.0
-                asset_stats[asset_id] = {
-                    "rows": rows,
-                    "missing_dates": missing_dates,
-                    "issue_rows": issue_rows,
-                    "issue_pct": pct,
-                }
-                table_rows += total_rows
-                table_issues += issue_rows
-            table_pct = float(table_issues) / table_rows * 100 if table_rows else 0.0
-            per_table[table_cfg.table] = {
-                "rows": table_rows,
-                "issues": table_issues,
-                "issue_pct": table_pct,
-                "assets": asset_stats,
-                "sin_asset_id": table_data.get("sin_asset_id"),
-            }
-            totals["rows"] += table_rows
-            totals["issues"] += table_issues
-        totals["issue_pct"] = float(totals["issues"]) / totals["rows"] * 100 if totals["rows"] else 0.0
-        return {
-            "totales": totals,
-            "tablas": per_table,
-        }
-
-    def _config_payload(self) -> Dict[str, Any]:
-        payload = asdict(self.cfg)
-        payload["reports_dir"] = str(self.cfg.reports_dir)
-        payload["logs_dir"] = str(self.cfg.logs_dir)
-        tables_payload = []
-        for table_cfg in self.cfg.tables:
-            tbl = asdict(table_cfg)
-            tbl["conflict_columns"] = list(table_cfg.conflict_columns)
-            tables_payload.append(tbl)
-        payload["tables"] = tables_payload
-        return payload
-
-    def config_hash(self) -> str:
-        payload = self._config_payload()
-        return sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
-
-    def save_audit_log(
-        self,
-        schema_report: Dict[str, Any],
-        analysis_before: Dict[str, Any],
-        refill_report: Dict[str, Any],
-        analysis_after: Optional[Dict[str, Any]],
-        stats_before: Dict[str, Any],
-        stats_after: Optional[Dict[str, Any]],
-        flags: List[Dict[str, Any]],
-    ) -> None:
-        cfg_hash = self.config_hash()
+    def persist(self, analysis: GapAnalysisResult, refill_actions: Dict[str, Any]) -> None:
         payload = {
-            "config": self._config_payload(),
-            "schema": schema_report,
-            "analisis_inicial": analysis_before,
-            "relleno": refill_report,
-            "analisis_final": analysis_after,
-            "estadisticas_iniciales": stats_before,
-            "estadisticas_finales": stats_after,
-            "timestamp": dt.datetime.utcnow().isoformat(),
-            "flags": flags,
+            "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "config_hash": self._config_hash(),
+            "analysis": analysis.to_json(),
+            "refill": refill_actions,
         }
-        self.db.ensure_tables(self.cfg.audit_table, self.cfg.flags_table)
-        query = f"INSERT INTO {self.cfg.audit_table} (config_hash, report) VALUES (%s, %s)"
-        self.db.execute(query, (cfg_hash, json.dumps(payload, default=str)))
+        self.cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        filename = self.cfg.output_dir / f"auditoria_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        filename.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        self.log.info("Audit trail guardado en %s", filename)
 
-    def export_report(self, payload: Dict[str, Any]) -> Path:
-        self.cfg.reports_dir.mkdir(parents=True, exist_ok=True)
-        filename = self.cfg.reports_dir / f"auditoria_completitud_{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(filename, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2, default=str)
-        return filename
+    def _config_hash(self) -> str:
+        raw = json.dumps([asdict(t) for t in self.cfg.timeseries_tables], sort_keys=True).encode("utf-8")
+        return sha256(raw).hexdigest()
 
-class NullCapitalComClient:
-    def __init__(self, logger: logging.Logger) -> None:
-        self.logger = logger.getChild("CapitalComNull")
 
-    def fetch_prices(self, epic: str, start: dt.datetime, end: dt.datetime, resolution: str) -> List[Dict[str, Any]]:
-        self.logger.warning(
-            "Cliente Capital.com no disponible. Se omite petición de %s (%s-%s) resolución %s",
-            epic,
-            start,
-            end,
-            resolution,
-        )
-        return []
+def summarise_statistics(analysis: GapAnalysisResult) -> Dict[str, Any]:
+    totals = {
+        "assets": 0,
+        "rows": 0,
+        "missing_dates": 0,
+        "field_gaps": 0,
+        "derived_updates": 0,
+    }
+    per_asset: Dict[str, Dict[str, Any]] = {}
+    for table_name, assets in analysis.tables.items():
+        for asset_id, payload in assets.items():
+            totals["assets"] += 1
+            totals["rows"] += payload.get("rows", 0)
+            totals["missing_dates"] += len(payload.get("missing_dates", []))
+            totals["field_gaps"] += sum(payload.get("field_gaps", {}).values())
+            totals["derived_updates"] += payload.get("derived_updates", 0)
+            key = f"{table_name}:{asset_id}"
+            per_asset[key] = {
+                "rows": payload.get("rows", 0),
+                "missing_dates": len(payload.get("missing_dates", [])),
+                "field_gaps": sum(payload.get("field_gaps", {}).values()),
+            }
+    totals["assets_with_gaps"] = sum(1 for asset in per_asset.values() if asset["missing_dates"] or asset["field_gaps"])
+    totals["gap_ratio"] = (
+        totals["assets_with_gaps"] / totals["assets"] * 100 if totals["assets"] else 0
+    )
+    return {"totals": totals, "per_asset": per_asset}
 
-def print_summary(
-    schema_report: Dict[str, Any],
-    stats_before: Dict[str, Any],
-    stats_after: Optional[Dict[str, Any]],
-    refill_report: Dict[str, Any],
-    flags: List[Dict[str, Any]],
-) -> None:
-    print("\n===== Resumen de Auditoría de Completitud =====")
-    orphans = schema_report.get("elementos_huerfanos", [])
-    print("Elementos huérfanos detectados:")
-    if not orphans:
-        print("  - Ninguno")
-    else:
-        for item in orphans:
-            print(
-                f"  - Tabla {item.get('tabla')} columna {item.get('columna')} sin referencia en {item.get('padre')} ({item.get('registros_huerfanos')} registros)"
-            )
 
-    print("\nPorcentaje de huecos iniciales:")
-    for table, info in stats_before.get("tablas", {}).items():
-        print(f"  - {table}: {info.get('issue_pct', 0):.2f}% de huecos (rows={info.get('rows')}, issues={info.get('issues')})")
-        for asset_id, asset_stats in info.get("assets", {}).items():
-            print(
-                f"      · Activo {asset_id}: {asset_stats.get('issue_pct', 0):.2f}% ({asset_stats.get('issue_rows')} huecos sobre {asset_stats.get('rows')} filas + {asset_stats.get('missing_dates')} fechas)"
-            )
+def save_analysis(cfg: AppConfig, analysis: GapAnalysisResult) -> Path:
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    path = cfg.output_dir / "completitud.json"
+    path.write_text(json.dumps(analysis.to_json(), indent=2, sort_keys=True), encoding="utf-8")
+    logging.getLogger("completitud").info("Informe JSON escrito en %s", path)
+    return path
 
-    if stats_after:
-        print("\nPorcentaje de huecos tras el relleno:")
-        for table, info in stats_after.get("tablas", {}).items():
-            print(f"  - {table}: {info.get('issue_pct', 0):.2f}% de huecos")
-            for asset_id, asset_stats in info.get("assets", {}).items():
-                print(
-                    f"      · Activo {asset_id}: {asset_stats.get('issue_pct', 0):.2f}% ({asset_stats.get('issue_rows')} huecos)"
-                )
-        print(
-            f"Total base de datos: {stats_after['totales'].get('issue_pct', 0):.2f}% (antes {stats_before['totales'].get('issue_pct', 0):.2f}%)"
-        )
-    else:
-        print(
-            f"Total base de datos: {stats_before['totales'].get('issue_pct', 0):.2f}% (re-análisis deshabilitado)"
-        )
 
-    print("\nAcciones de relleno ejecutadas:")
-    if not refill_report:
-        print("  - No se completaron huecos o relleno deshabilitado.")
-    else:
-        for table, actions in refill_report.items():
-            print(f"  - Tabla {table}:")
-            for action in actions:
-                status = action.get("resultado")
-                rng = action.get("rango")
-                source = action.get("source", "-")
-                if status == "actualizado":
-                    print(
-                        f"      · Activo {action.get('asset_id')} {rng} rellenado ({action.get('insertados')} registros) desde {source}"
-                    )
-                elif status == "derivado":
-                    campos = action.get("campos") or {}
-                    if isinstance(campos, dict):
-                        campos_list = ", ".join(sorted(campos.keys()))
-                    elif isinstance(campos, (list, set, tuple)):
-                        campos_list = ", ".join(sorted(campos))
-                    else:
-                        campos_list = str(campos)
-                    ts = action.get("timestamp", rng if isinstance(rng, str) else "-")
-                    print(
-                        f"      · Activo {action.get('asset_id')} fecha {ts} completado por derivación local ({campos_list})"
-                    )
-                elif status == "omitido":
-                    print(
-                        f"      · Activo {action.get('asset_id')} {rng} omitido por flags previos ({len(action.get('skipped_flags', []))} fechas)"
-                    )
-                else:
-                    print(
-                        f"      · Activo {action.get('asset_id')} {rng} fallo ({status}) fuente {source}: {action.get('error')}"
-                    )
-
-    print("\nFlags activos (intentos fallidos >= 3):")
-    if not flags:
-        print("  - Ninguno")
-    else:
-        for flag in flags:
-            print(
-                f"  - Tabla {flag.get('table_name')} activo {flag.get('asset_id')} fecha {flag.get('datetime_value')} (intentos={flag.get('failure_count')})"
-            )
-    print("===== Fin del resumen =====\n")
+def print_summary(stats: Dict[str, Any]) -> None:
+    totals = stats["totals"]
+    logging.getLogger("completitud").info(
+        "Activos analizados: %d | Huecos detectados: %d fechas, %d campos | %% activos con huecos: %.2f",
+        totals["assets"],
+        totals["missing_dates"],
+        totals["field_gaps"],
+        totals["gap_ratio"],
+    )
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Auditoría y completitud de series financieras")
-    parser.add_argument("--max-activos", type=int, dest="max_activos", help="Limita el número de activos a analizar por tabla")
-    parser.add_argument("--sin-rellenar", action="store_true", help="No intenta completar huecos con APIs externas")
-    parser.add_argument("--sin-reanalizar", action="store_true", help="No realiza un segundo análisis tras el relleno")
+    parser = argparse.ArgumentParser(description="Auditoría de completitud de datos financieros")
+    parser.add_argument(
+        "--sin-relleno",
+        action="store_true",
+        help="No intentar completar datos faltantes",
+    )
+    parser.add_argument(
+        "--max-activos",
+        type=int,
+        default=None,
+        help="Limitar el número de activos analizados por tabla",
+    )
+    parser.add_argument(
+        "--env",
+        type=str,
+        default=None,
+        help="Ruta a un archivo .env alternativo",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
-    cfg = AppConfig.from_env()
-    if args.max_activos is not None:
-        cfg.max_assets = args.max_activos
-    if args.sin_rellenar:
-        cfg.enable_refill = False
-    if args.sin_reanalizar:
-        cfg.reanalyse_after_fill = False
-
+    cfg = AppConfig.from_env(Path(args.env) if args.env else None)
     setup_logging(cfg)
-    logger = logging.getLogger("completitud")
+    log = logging.getLogger("completitud")
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        with DatabaseManager(cfg, logger) as db:
-            try:
-                capital_client = CapitalComClient(cfg, logger)
-            except Exception as exc:
-                logger.error("No se pudo iniciar cliente Capital.com: %s", exc)
-                capital_client = NullCapitalComClient(logger)
-            fmp_client = FMPClient(cfg, logger)
-            yf_client = YahooFinanceClient(logger)
-            auditor = DataCompletenessAuditor(cfg, db, capital_client, fmp_client, yf_client)
+    with Database(cfg) as db:
+        inspector = SchemaInspector(db, cfg)
+        inspector.report()
+        assets = AssetResolver(db, cfg)
+        assets.load()
 
-            schema_report = auditor.inspect_schema()
-            analysis_before = auditor.analyse_all_tables()
-            stats_before = auditor.compute_gap_stats(analysis_before)
-            refill_report = auditor.refill_data(analysis_before)
+        analyzer = TimeseriesAnalyzer(db, cfg, assets, max_assets=args.max_activos)
+        analysis = analyzer.run()
 
-            analysis_after: Optional[Dict[str, Any]] = None
-            stats_after: Optional[Dict[str, Any]] = None
-            if cfg.reanalyse_after_fill:
-                analysis_after = auditor.analyse_all_tables()
-                stats_after = auditor.compute_gap_stats(analysis_after)
+        save_analysis(cfg, analysis)
+        stats = summarise_statistics(analysis)
+        print_summary(stats)
 
-            flags = db.list_flags()
+        if not args.sin_relleno:
+            refiller = Refiller(db, cfg, assets)
+            refill_actions = refiller.refill(analysis)
+        else:
+            refill_actions = {}
+            log.info("Modo sin relleno activado, no se completan huecos")
 
-            report_payload = {
-                "schema": schema_report,
-                "analisis_inicial": analysis_before,
-                "relleno": refill_report,
-                "analisis_final": analysis_after,
-                "estadisticas_iniciales": stats_before,
-                "estadisticas_finales": stats_after,
-                "flags": flags,
-            }
-            report_path = auditor.export_report(report_payload)
-            auditor.save_audit_log(
-                schema_report,
-                analysis_before,
-                refill_report,
-                analysis_after,
-                stats_before,
-                stats_after,
-                flags,
-            )
-            logger.info("Informe detallado almacenado en %s", report_path)
-            print_summary(schema_report, stats_before, stats_after, refill_report, flags)
-    except Exception as exc:
-        logger.exception("Ejecución abortada por error crítico: %s", exc)
-        raise
+        audit = AuditTrail(cfg)
+        audit.persist(analysis, refill_actions)
+
+    log.info("Proceso completado")
 
 
 if __name__ == "__main__":

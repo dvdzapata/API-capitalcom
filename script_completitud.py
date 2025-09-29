@@ -53,6 +53,7 @@ para limitar el número de activos auditados, etc.).
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime as dt
 import json
 import logging
@@ -182,8 +183,12 @@ def _json_env(name: str) -> Optional[Any]:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        logging.getLogger(__name__).warning("No se pudo parsear %s como JSON", name)
-        return None
+        logger = logging.getLogger(__name__)
+        try:
+            return ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            logger.warning("No se pudo parsear %s como JSON", name)
+            return None
 
 
 @dataclass
@@ -205,6 +210,7 @@ class TimeseriesTableConfig:
     provider: Optional[str] = None
     endpoint_templates: Dict[str, str] = field(default_factory=dict)
     field_mappings: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    enabled: bool = True
 
     def expected_timedelta(self) -> Optional[pd.Timedelta]:
         if self.frequency == "daily":
@@ -336,6 +342,7 @@ class AppConfig:
                         provider=item.get("provider"),
                         endpoint_templates=item.get("endpoint_templates", {}),
                         field_mappings=item.get("field_mappings", {}),
+                        enabled=item.get("enabled", True),
                     )
                 )
 
@@ -363,7 +370,7 @@ class AppConfig:
 
 def setup_logging(cfg: AppConfig) -> None:
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
-    log_file = cfg.logs_dir / f"completitud_{dt.datetime.utcnow().strftime('%Y%m%d')}.log"
+    log_file = cfg.logs_dir / f"completitud_{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d')}.log"
     formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s - %(message)s", "%Y-%m-%d %H:%M:%S"
     )
@@ -563,6 +570,13 @@ class DatabaseManager:
         self.conn = psycopg2.connect(cfg.pg_dsn)
         self.conn.autocommit = False
 
+    @staticmethod
+    def _split_table_name(table: str) -> Tuple[str, str]:
+        if "." in table:
+            schema, name = table.split(".", 1)
+            return schema, name
+        return "public", table
+
     def close(self) -> None:
         self.conn.close()
 
@@ -586,6 +600,18 @@ class DatabaseManager:
         with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(query)
             return cur.fetchall()
+
+    def get_table_columns(self, table: str) -> Dict[str, Dict[str, Any]]:
+        schema, name = self._split_table_name(table)
+        query = """
+        SELECT column_name, data_type, udt_name
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+        ORDER BY ordinal_position
+        """
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(query, (schema, name))
+            return {row["column_name"]: dict(row) for row in cur.fetchall()}
 
     def list_views(self) -> List[Dict[str, Any]]:
         query = """
@@ -834,11 +860,133 @@ class DataCompletenessAuditor:
         self.logger = logging.getLogger("DataCompletenessAuditor")
         self.asset_metadata: Dict[Any, Dict[str, Any]] = {}
         self._normalize_cache: Dict[str, Dict[Any, Optional[pd.Timestamp]]] = {}
+        self.table_columns: Dict[str, Dict[str, Any]] = {}
         if cfg.asset_lookup_query:
             try:
                 self.asset_metadata = db.fetch_asset_metadata(cfg.asset_lookup_query)
             except Exception as exc:
                 self.logger.warning("No se pudo obtener metadata de activos: %s", exc)
+        self._prepare_table_configs()
+
+    def _prepare_table_configs(self) -> None:
+        for table_cfg in self.cfg.tables:
+            try:
+                columns = self.db.get_table_columns(table_cfg.table)
+            except Exception as exc:
+                self.logger.error(
+                    "No se pudieron obtener las columnas de %s: %s", table_cfg.table, exc
+                )
+                table_cfg.enabled = False
+                continue
+            self.table_columns[table_cfg.table] = columns
+            self._normalize_table_config(table_cfg, columns)
+
+    @staticmethod
+    def _pick_column(
+        columns: Dict[str, Dict[str, Any]],
+        candidates: Sequence[Optional[str]],
+        type_hints: Optional[Sequence[str]] = None,
+    ) -> Optional[str]:
+        for candidate in candidates:
+            if candidate and candidate in columns:
+                return candidate
+        if type_hints:
+            lowered_hints = {hint.lower() for hint in type_hints}
+            for name, meta in columns.items():
+                data_type = str(meta.get("data_type", "")).lower()
+                udt = str(meta.get("udt_name", "")).lower()
+                if data_type in lowered_hints or udt in lowered_hints:
+                    return name
+        return None
+
+    def _normalize_table_config(
+        self, cfg: TimeseriesTableConfig, columns: Dict[str, Dict[str, Any]]
+    ) -> None:
+        asset_col = cfg.asset_column
+        if asset_col not in columns:
+            replacement = self._pick_column(
+                columns,
+                [
+                    asset_col,
+                    "asset_id",
+                    "id_activo",
+                    "id_asset",
+                    "instrument_id",
+                ],
+                ("integer", "bigint", "uuid", "text"),
+            )
+            if replacement:
+                self.logger.info(
+                    "Columna de activo %s no encontrada en %s, se usará %s",
+                    asset_col,
+                    cfg.table,
+                    replacement,
+                )
+                cfg.asset_column = replacement
+            else:
+                self.logger.error(
+                    "No se encontró ninguna columna de activo para %s; se deshabilita la tabla",
+                    cfg.table,
+                )
+                cfg.enabled = False
+                return
+
+        dt_col = cfg.datetime_column
+        if dt_col not in columns:
+            replacement = self._pick_column(
+                columns,
+                [
+                    dt_col,
+                    "fecha",
+                    "timestamp",
+                    "fecha_hora",
+                    "fechaHora",
+                    "datetime",
+                    "ts",
+                ],
+                ("timestamp with time zone", "timestamp without time zone", "timestamptz"),
+            )
+            if replacement:
+                self.logger.info(
+                    "Columna temporal %s no encontrada en %s, se usará %s",
+                    dt_col,
+                    cfg.table,
+                    replacement,
+                )
+                cfg.datetime_column = replacement
+            else:
+                self.logger.error(
+                    "No se encontró ninguna columna temporal para %s; se deshabilita la tabla",
+                    cfg.table,
+                )
+                cfg.enabled = False
+                return
+
+        existing_data_columns = [col for col in cfg.data_columns if col in columns]
+        missing_data_columns = [col for col in cfg.data_columns if col not in columns]
+        if missing_data_columns:
+            self.logger.warning(
+                "Columnas de datos ausentes en %s: %s", cfg.table, ", ".join(missing_data_columns)
+            )
+        if not existing_data_columns:
+            self.logger.error(
+                "No quedan columnas de datos válidas en %s; se deshabilita la tabla",
+                cfg.table,
+            )
+            cfg.enabled = False
+            return
+        if existing_data_columns != cfg.data_columns:
+            cfg.data_columns = existing_data_columns
+
+        if cfg.conflict_columns:
+            conflict = [col for col in cfg.conflict_columns if col in columns]
+        else:
+            conflict = []
+        if cfg.asset_column not in conflict:
+            conflict.append(cfg.asset_column)
+        if cfg.datetime_column not in conflict:
+            conflict.append(cfg.datetime_column)
+        cfg.conflict_columns = conflict
 
     def _table_timezone(self, cfg: TimeseriesTableConfig) -> str:
         return cfg.timezone or self.cfg.timezone or "UTC"
@@ -1003,6 +1151,9 @@ class DataCompletenessAuditor:
         }
 
     def analyse_table(self, cfg: TimeseriesTableConfig) -> Dict[str, Any]:
+        if not cfg.enabled:
+            self.logger.info("Tabla %s omitida por configuración deshabilitada", cfg.table)
+            return {"status": "skipped"}
         self.logger.info("Analizando %s", cfg.table)
         assets = self.db.fetch_distinct_assets(cfg.table, cfg.asset_column, self.cfg.max_assets)
         null_query = f"SELECT COUNT(*) FROM {cfg.table} WHERE {cfg.asset_column} IS NULL"
@@ -1178,6 +1329,12 @@ class DataCompletenessAuditor:
     def analyse_all_tables(self) -> Dict[str, Any]:
         results = {}
         for table_cfg in self.cfg.tables:
+            if not table_cfg.enabled:
+                self.logger.info(
+                    "Se omite %s porque no se pudo validar su configuración", table_cfg.table
+                )
+                results[table_cfg.table] = {"status": "skipped"}
+                continue
             results[table_cfg.table] = self.analyse_table(table_cfg)
         return results
 
@@ -1187,6 +1344,8 @@ class DataCompletenessAuditor:
             return {}
         refill_report: Dict[str, Any] = {}
         for table_cfg in self.cfg.tables:
+            if not table_cfg.enabled:
+                continue
             table_result = analysis.get(table_cfg.table, {})
             asset_reports = table_result.get("assets", {}) if isinstance(table_result, dict) else {}
             table_actions: List[Dict[str, Any]] = []

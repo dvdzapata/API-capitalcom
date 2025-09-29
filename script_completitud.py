@@ -161,6 +161,12 @@ YF_FIELD_MAP = {
     "volume": "Volume",
 }
 
+PROVIDER_LABELS = {
+    "capital": "Capital.com",
+    "fmp": "Financial Modeling Prep",
+    "yfinance": "Yahoo Finance",
+}
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -196,6 +202,9 @@ class TimeseriesTableConfig:
     symbol_column: Optional[str] = None
     price_floor: Optional[float] = None
     price_ceiling: Optional[float] = None
+    provider: Optional[str] = None
+    endpoint_templates: Dict[str, str] = field(default_factory=dict)
+    field_mappings: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
     def expected_timedelta(self) -> Optional[pd.Timedelta]:
         if self.frequency == "daily":
@@ -239,6 +248,9 @@ class AppConfig:
                 data_columns=["open", "high", "low", "close", "volume"],
                 frequency="daily",
                 conflict_columns=["asset_id", "fecha"],
+                provider="capital",
+                endpoint_templates={"default": "/prices/{epic}"},
+                field_mappings={"capital": dict(CAPITAL_FIELD_MAP)},
             ),
             TimeseriesTableConfig(
                 table="cotizaciones_intradia_cfd",
@@ -248,6 +260,9 @@ class AppConfig:
                 frequency="intraday",
                 interval_minutes=1,
                 conflict_columns=["asset_id", "timestamp"],
+                provider="capital",
+                endpoint_templates={"default": "/prices/{epic}"},
+                field_mappings={"capital": dict(CAPITAL_FIELD_MAP)},
             ),
             TimeseriesTableConfig(
                 table="cotizaciones_diarias",
@@ -256,6 +271,15 @@ class AppConfig:
                 data_columns=["open", "high", "low", "close", "volume"],
                 frequency="daily",
                 conflict_columns=["asset_id", "fecha"],
+                provider="fmp",
+                endpoint_templates={
+                    "daily": "/historical-price-full/{symbol}",
+                    "intraday": "/historical-chart/{interval}min/{symbol}",
+                },
+                field_mappings={
+                    "daily": dict(FMP_DAILY_FIELD_MAP),
+                    "intraday": dict(FMP_INTRADAY_FIELD_MAP),
+                },
             ),
             TimeseriesTableConfig(
                 table="cotizaciones_intradia",
@@ -265,6 +289,15 @@ class AppConfig:
                 frequency="intraday",
                 interval_minutes=1,
                 conflict_columns=["asset_id", "timestamp"],
+                provider="fmp",
+                endpoint_templates={
+                    "daily": "/historical-price-full/{symbol}",
+                    "intraday": "/historical-chart/{interval}min/{symbol}",
+                },
+                field_mappings={
+                    "daily": dict(FMP_DAILY_FIELD_MAP),
+                    "intraday": dict(FMP_INTRADAY_FIELD_MAP),
+                },
             ),
         ]
 
@@ -300,6 +333,9 @@ class AppConfig:
                         symbol_column=item.get("symbol_column"),
                         price_floor=item.get("price_floor"),
                         price_ceiling=item.get("price_ceiling"),
+                        provider=item.get("provider"),
+                        endpoint_templates=item.get("endpoint_templates", {}),
+                        field_mappings=item.get("field_mappings", {}),
                     )
                 )
 
@@ -803,6 +839,117 @@ class DataCompletenessAuditor:
             except Exception as exc:
                 self.logger.warning("No se pudo obtener metadata de activos: %s", exc)
 
+    def _table_timezone(self, cfg: TimeseriesTableConfig) -> str:
+        return cfg.timezone or self.cfg.timezone or "UTC"
+
+    def _parse_timestamp(self, cfg: TimeseriesTableConfig, value: Any) -> Optional[pd.Timestamp]:
+        try:
+            ts = pd.Timestamp(value)
+        except Exception:
+            self.logger.debug("No se pudo interpretar timestamp %s para %s", value, cfg.table)
+            return None
+        if pd.isna(ts):
+            return None
+        tz_name = self._table_timezone(cfg)
+        if tz_name:
+            try:
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize(tz_name)
+                else:
+                    ts = ts.tz_convert(tz_name)
+            except Exception:
+                self.logger.debug(
+                    "Fallo al ajustar zona horaria %s para %s en %s", tz_name, value, cfg.table,
+                    exc_info=True,
+                )
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                else:
+                    ts = ts.tz_convert("UTC")
+        elif ts.tzinfo is not None:
+            ts = ts.tz_convert("UTC")
+        return ts
+
+    def _apply_table_timezone(self, cfg: TimeseriesTableConfig, series: pd.Series) -> pd.Series:
+        return series.apply(lambda val: self._parse_timestamp(cfg, val))
+
+    def _current_timestamp(self, cfg: TimeseriesTableConfig) -> pd.Timestamp:
+        tz_name = self._table_timezone(cfg) or "UTC"
+        now_utc = pd.Timestamp.now(tz="UTC")
+        return now_utc if tz_name == "UTC" else now_utc.tz_convert(tz_name)
+
+    @staticmethod
+    def _to_utc_timestamp(ts: pd.Timestamp) -> pd.Timestamp:
+        if ts.tzinfo is None:
+            return ts.tz_localize("UTC")
+        return ts.tz_convert("UTC")
+
+    def _to_utc_datetime(self, ts: pd.Timestamp) -> dt.datetime:
+        return self._to_utc_timestamp(pd.Timestamp(ts)).to_pydatetime()
+
+    @staticmethod
+    def _provider_label(provider: str) -> str:
+        return PROVIDER_LABELS.get(provider, provider)
+
+    def _resolve_field_map(
+        self,
+        cfg: TimeseriesTableConfig,
+        provider: str,
+        fields_sorted: Sequence[str],
+    ) -> Dict[str, str]:
+        mapping: Optional[Dict[str, str]] = None
+        if cfg.field_mappings:
+            for key in (
+                f"{provider}_{cfg.frequency}",
+                cfg.frequency,
+                provider,
+                "default",
+            ):
+                candidate = cfg.field_mappings.get(key)
+                if isinstance(candidate, dict):
+                    mapping = candidate
+                    break
+        if mapping is None:
+            if provider == "capital":
+                mapping = CAPITAL_FIELD_MAP
+            elif provider == "fmp":
+                mapping = FMP_DAILY_FIELD_MAP if cfg.frequency == "daily" else FMP_INTRADAY_FIELD_MAP
+            else:
+                mapping = {}
+        return {field: mapping.get(field, field) for field in fields_sorted}
+
+    def _resolve_endpoint(
+        self,
+        cfg: TimeseriesTableConfig,
+        provider: str,
+        interval_minutes: Optional[int] = None,
+    ) -> str:
+        template: Optional[str] = None
+        if cfg.endpoint_templates:
+            for key in (
+                f"{provider}_{cfg.frequency}",
+                cfg.frequency,
+                provider,
+                "default",
+            ):
+                candidate = cfg.endpoint_templates.get(key)
+                if candidate:
+                    template = candidate
+                    break
+        if not template:
+            if provider == "capital":
+                template = "/prices/{epic}"
+            elif provider == "fmp":
+                if cfg.frequency == "daily":
+                    template = "/historical-price-full/{symbol}"
+                else:
+                    interval = interval_minutes or cfg.interval_minutes or 1
+                    template = f"/historical-chart/{interval}min/{{symbol}}"
+            else:
+                template = ""
+        interval_value = interval_minutes or cfg.interval_minutes or 1
+        return template.replace("{interval}", str(interval_value))
+
     def inspect_schema(self) -> Dict[str, Any]:
         tables = self.db.list_tables()
         views = self.db.list_views()
@@ -886,6 +1033,20 @@ class DataCompletenessAuditor:
             self.logger.warning("La tabla %s no contiene la columna temporal %s", cfg.table, cfg.datetime_column)
             return issues
 
+        df[cfg.datetime_column] = self._apply_table_timezone(cfg, df[cfg.datetime_column])
+        missing_ts_mask = df[cfg.datetime_column].isna()
+        if missing_ts_mask.any():
+            for idx, row in df[missing_ts_mask].iterrows():
+                issues["missing_rows"].append(
+                    {
+                        "index": int(idx),
+                        "timestamp": None,
+                        "row": {col: row.get(col) for col in cfg.data_columns},
+                    }
+                )
+        df = df[~missing_ts_mask].copy()
+        if df.empty:
+            return issues
         df[cfg.datetime_column] = pd.to_datetime(df[cfg.datetime_column])
         df = df.sort_values(cfg.datetime_column).reset_index(drop=True)
         issues["stats"]["rows"] = len(df)
@@ -977,7 +1138,7 @@ class DataCompletenessAuditor:
 
         if timestamps:
             last_ts = timestamps[-1]
-            now_ts = pd.Timestamp.utcnow().tz_localize(None)
+            now_ts = self._current_timestamp(cfg)
             if cfg.frequency == "daily":
                 expected_last = now_ts.normalize()
                 while not cfg.allow_weekends and not is_business_day(expected_last):
@@ -988,8 +1149,9 @@ class DataCompletenessAuditor:
                         if cfg.allow_weekends or is_business_day(missing):
                             missing_dates.append(missing)
             elif expected_delta is not None:
-                if now_ts - last_ts > expected_delta * 2:
-                    steps = int(((now_ts - last_ts) / expected_delta))
+                gap = now_ts - last_ts
+                if gap >= expected_delta:
+                    steps = int(math.ceil(gap / expected_delta))
                     for step in range(1, steps + 1):
                         missing_dates.append(last_ts + step * expected_delta)
 
@@ -1023,17 +1185,16 @@ class DataCompletenessAuditor:
     def _refill_asset(self, cfg: TimeseriesTableConfig, asset_id: Any, asset_report: Dict[str, Any]) -> List[Dict[str, Any]]:
         timestamps: List[pd.Timestamp] = []
         for date_str in asset_report.get("missing_dates", []):
-            try:
-                timestamps.append(pd.Timestamp(date_str))
-            except Exception:
-                continue
+            ts = self._parse_timestamp(cfg, date_str)
+            if ts is not None:
+                timestamps.append(ts)
         for row_issue in asset_report.get("missing_rows", []) + asset_report.get("invalid_rows", []):
-            ts = row_issue.get("timestamp")
-            if ts:
-                try:
-                    timestamps.append(pd.Timestamp(ts))
-                except Exception:
-                    continue
+            ts_raw = row_issue.get("timestamp")
+            if not ts_raw:
+                continue
+            ts = self._parse_timestamp(cfg, ts_raw)
+            if ts is not None:
+                timestamps.append(ts)
         if not timestamps:
             return []
 
@@ -1153,8 +1314,11 @@ class DataCompletenessAuditor:
                 )
         return actions
 
-    def _normalize_for_cfg(self, cfg: TimeseriesTableConfig, ts: pd.Timestamp) -> pd.Timestamp:
-        return ts.normalize() if cfg.frequency == "daily" else ts
+    def _normalize_for_cfg(self, cfg: TimeseriesTableConfig, ts: Any) -> Optional[pd.Timestamp]:
+        parsed = self._parse_timestamp(cfg, ts)
+        if parsed is None:
+            return None
+        return parsed.normalize() if cfg.frequency == "daily" else parsed
 
     def _attempt_derivations(
         self,
@@ -1172,12 +1336,11 @@ class DataCompletenessAuditor:
             ts_raw = issue.get("timestamp")
             if not ts_raw:
                 continue
-            try:
-                ts = pd.Timestamp(ts_raw)
-            except Exception:
+            ts = self._parse_timestamp(cfg, ts_raw)
+            if ts is None:
                 continue
             ts_key = self._normalize_for_cfg(cfg, ts)
-            if ts_key in processed:
+            if ts_key is None or ts_key in processed:
                 continue
             processed.add(ts_key)
             dt_value = ts.to_pydatetime()
@@ -1436,18 +1599,21 @@ class DataCompletenessAuditor:
         derived_fields: Dict[pd.Timestamp, Set[str]],
     ) -> Set[str]:
         needed: Set[str] = set()
-        ts_set = {self._normalize_for_cfg(cfg, ts) for ts in timestamps}
+        ts_set: Set[pd.Timestamp] = set()
+        for ts in timestamps:
+            normalized = self._normalize_for_cfg(cfg, ts)
+            if normalized is not None:
+                ts_set.add(normalized)
 
         for row_issue in asset_report.get("missing_rows", []) or []:
             ts_raw = row_issue.get("timestamp")
             if not ts_raw:
                 continue
-            try:
-                ts = pd.Timestamp(ts_raw)
-            except Exception:
+            ts = self._parse_timestamp(cfg, ts_raw)
+            if ts is None:
                 continue
             ts_key = self._normalize_for_cfg(cfg, ts)
-            if ts_key not in ts_set:
+            if ts_key is None or ts_key not in ts_set:
                 continue
             row_data = row_issue.get("row") or {}
             for column in cfg.data_columns:
@@ -1463,21 +1629,19 @@ class DataCompletenessAuditor:
             ts_raw = row_issue.get("timestamp")
             if not ts_raw:
                 continue
-            try:
-                ts = pd.Timestamp(ts_raw)
-            except Exception:
+            ts = self._parse_timestamp(cfg, ts_raw)
+            if ts is None:
                 continue
             ts_key = self._normalize_for_cfg(cfg, ts)
-            if ts_key in ts_set:
+            if ts_key is not None and ts_key in ts_set:
                 needed.update(cfg.data_columns)
 
         for ts_raw in asset_report.get("missing_dates", []) or []:
-            try:
-                ts = pd.Timestamp(ts_raw)
-            except Exception:
+            ts = self._parse_timestamp(cfg, ts_raw)
+            if ts is None:
                 continue
             ts_key = self._normalize_for_cfg(cfg, ts)
-            if ts_key in ts_set:
+            if ts_key is not None and ts_key in ts_set:
                 needed.update(cfg.data_columns)
 
         if not needed:
@@ -1493,48 +1657,25 @@ class DataCompletenessAuditor:
     ) -> Dict[str, Any]:
         source = self._select_source(cfg)
         fields_sorted = sorted(fields_needed)
-        if source == "capital":
-            mapping = {field: CAPITAL_FIELD_MAP.get(field, field) for field in fields_sorted}
-            return {
-                "provider": "Capital.com",
-                "endpoint": "/prices/{epic}",
-                "requested_fields": fields_sorted,
-                "field_map": mapping,
-            }
-
-        if source == "fmp":
-            if cfg.frequency == "daily":
-                mapping = {field: FMP_DAILY_FIELD_MAP.get(field, field) for field in fields_sorted}
-                detail: Dict[str, Any] = {
-                    "provider": "Financial Modeling Prep",
-                    "endpoint": "/historical-price-full/{symbol}",
-                    "requested_fields": fields_sorted,
-                    "field_map": mapping,
-                }
-            else:
-                mapping = {field: FMP_INTRADAY_FIELD_MAP.get(field, field) for field in fields_sorted}
-                interval = interval_minutes or cfg.interval_minutes or 1
-                detail = {
-                    "provider": "Financial Modeling Prep",
-                    "endpoint": f"/historical-chart/{interval}min/{{symbol}}",
-                    "requested_fields": fields_sorted,
-                    "field_map": mapping,
-                }
-            if fallback_used and HAS_YFINANCE:
-                detail["fallback"] = {
-                    "provider": "Yahoo Finance",
-                    "endpoint": "yfinance.download",
-                    "field_map": {field: YF_FIELD_MAP.get(field, field) for field in fields_sorted},
-                }
-            return detail
-
-        return {
-            "provider": source,
+        endpoint = self._resolve_endpoint(cfg, source, interval_minutes)
+        detail: Dict[str, Any] = {
+            "provider": self._provider_label(source),
             "requested_fields": fields_sorted,
-            "field_map": {field: field for field in fields_sorted},
+            "field_map": self._resolve_field_map(cfg, source, fields_sorted),
         }
+        if endpoint:
+            detail["endpoint"] = endpoint
+        if source == "fmp" and fallback_used and HAS_YFINANCE:
+            detail["fallback"] = {
+                "provider": self._provider_label("yfinance"),
+                "endpoint": "yfinance.download",
+                "field_map": {field: YF_FIELD_MAP.get(field, field) for field in fields_sorted},
+            }
+        return detail
 
     def _select_source(self, cfg: TimeseriesTableConfig) -> str:
+        if cfg.provider:
+            return cfg.provider
         if cfg.table.endswith("_cfd"):
             return "capital"
         return "fmp"
@@ -1550,40 +1691,64 @@ class DataCompletenessAuditor:
         fields_needed: Set[str],
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         source = self._select_source(cfg)
+        interval_value = cfg.interval_minutes or 1
+        start_ts = self._parse_timestamp(cfg, start)
+        end_ts = self._parse_timestamp(cfg, end)
+        if start_ts is None or end_ts is None:
+            return [], self._build_source_detail(cfg, fields_needed, interval_minutes=interval_value)
         if source == "capital":
             if not epic:
                 self.logger.warning("No se dispone de epic para %s en %s", symbol, cfg.table)
-                return [], self._build_source_detail(cfg, fields_needed)
-            resolution = "DAY" if cfg.frequency == "daily" else f"MINUTE_{cfg.interval_minutes or 1}"
-            records = self.capital.fetch_prices(epic, start.to_pydatetime(), end.to_pydatetime(), resolution)
-            return records, self._build_source_detail(cfg, fields_needed)
+                return [], self._build_source_detail(cfg, fields_needed, interval_minutes=interval_value)
+            resolution = "DAY" if cfg.frequency == "daily" else f"MINUTE_{interval_value}"
+            records = self.capital.fetch_prices(
+                epic,
+                self._to_utc_datetime(start_ts),
+                self._to_utc_datetime(end_ts),
+                resolution,
+            )
+            return records, self._build_source_detail(cfg, fields_needed, interval_minutes=interval_value)
         if source == "fmp":
             if not symbol:
                 self.logger.warning("No se dispone de símbolo para activo %s en %s", timestamps, cfg.table)
-                return [], self._build_source_detail(cfg, fields_needed)
+                return [], self._build_source_detail(cfg, fields_needed, interval_minutes=interval_value)
+            fallback_used = False
             if cfg.frequency == "daily":
-                records = self.fmp.fetch_daily(symbol, start.date(), end.date())
-                fallback_used = False
+                records = self.fmp.fetch_daily(symbol, start_ts.date(), end_ts.date())
             else:
-                records = self.fmp.fetch_intraday(symbol, cfg.interval_minutes or 1, start.to_pydatetime(), end.to_pydatetime())
-                fallback_used = False
+                records = self.fmp.fetch_intraday(
+                    symbol,
+                    interval_value,
+                    self._to_utc_datetime(start_ts),
+                    self._to_utc_datetime(end_ts),
+                )
             if not records and HAS_YFINANCE:
                 if cfg.frequency == "daily":
-                    yf_records = self.yf_client.fetch(symbol, start.to_pydatetime(), end.to_pydatetime(), interval="1d")
+                    yf_records = self.yf_client.fetch(
+                        symbol,
+                        self._to_utc_datetime(start_ts),
+                        self._to_utc_datetime(end_ts),
+                        interval="1d",
+                    )
                 else:
-                    interval = "1m" if (cfg.interval_minutes or 1) <= 1 else f"{cfg.interval_minutes}m"
-                    yf_records = self.yf_client.fetch(symbol, start.to_pydatetime(), end.to_pydatetime(), interval=interval)
+                    interval = "1m" if interval_value <= 1 else f"{interval_value}m"
+                    yf_records = self.yf_client.fetch(
+                        symbol,
+                        self._to_utc_datetime(start_ts),
+                        self._to_utc_datetime(end_ts),
+                        interval=interval,
+                    )
                 if yf_records:
                     records.extend(yf_records)
                     fallback_used = True
             detail = self._build_source_detail(
                 cfg,
                 fields_needed,
-                interval_minutes=cfg.interval_minutes or 1,
+                interval_minutes=interval_value,
                 fallback_used=fallback_used,
             )
             return records, detail
-        return [], self._build_source_detail(cfg, fields_needed)
+        return [], self._build_source_detail(cfg, fields_needed, interval_minutes=interval_value)
 
     def _normalize_records(self, cfg: TimeseriesTableConfig, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         normalized: List[Dict[str, Any]] = []
@@ -1596,7 +1761,9 @@ class DataCompletenessAuditor:
     def _normalize_record(self, cfg: TimeseriesTableConfig, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if "snapshotTimeUTC" in rec or "snapshotTime" in rec:
             timestamp = rec.get("snapshotTimeUTC") or rec.get("snapshotTime")
-            timestamp = pd.Timestamp(timestamp).to_pydatetime()
+            ts = self._parse_timestamp(cfg, timestamp)
+            if ts is None:
+                return None
             def pick_price(node: Any) -> Optional[float]:
                 if isinstance(node, (int, float)):
                     return float(node)
@@ -1610,7 +1777,7 @@ class DataCompletenessAuditor:
                                 continue
                 return None
             norm = {
-                "timestamp": timestamp,
+                "timestamp": ts,
                 "open": pick_price(rec.get("openPrice")),
                 "high": pick_price(rec.get("highPrice")),
                 "low": pick_price(rec.get("lowPrice")),
@@ -1619,9 +1786,11 @@ class DataCompletenessAuditor:
             }
             return norm
         if "date" in rec:
-            timestamp = pd.Timestamp(rec.get("date")).to_pydatetime()
+            ts = self._parse_timestamp(cfg, rec.get("date"))
+            if ts is None:
+                return None
             norm = {
-                "timestamp": timestamp,
+                "timestamp": ts,
                 "open": as_float(rec.get("open")),
                 "high": as_float(rec.get("high")),
                 "low": as_float(rec.get("low")),
@@ -1630,9 +1799,11 @@ class DataCompletenessAuditor:
             }
             return norm
         if "timestamp" in rec:
-            timestamp = pd.Timestamp(rec.get("timestamp")).to_pydatetime()
+            ts = self._parse_timestamp(cfg, rec.get("timestamp"))
+            if ts is None:
+                return None
             norm = {
-                "timestamp": timestamp,
+                "timestamp": ts,
                 "open": as_float(rec.get("open")),
                 "high": as_float(rec.get("high")),
                 "low": as_float(rec.get("low")),

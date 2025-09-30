@@ -222,7 +222,7 @@ class AppConfig:
             load_dotenv(env_path)
 
         tables_raw: List[Dict[str, Any]]
-        tables_str = os.getenv("TIMESERIES_TABLES_JSON")
+        tables_str = os.getenv("TIMESERIES_TABLES_JSON", "").strip()
         if tables_str:
             try:
                 tables_raw = json.loads(tables_str)
@@ -277,16 +277,27 @@ def setup_logging(cfg: AppConfig) -> None:
 class Database:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
-        self.conn = psycopg2.connect(
-            host=cfg.db_host,
-            port=cfg.db_port,
-            dbname=cfg.db_name,
-            user=cfg.db_user,
-            password=cfg.db_password,
-            cursor_factory=psycopg2.extras.RealDictCursor,
-        )
-        self.conn.autocommit = False
         self.log = logging.getLogger("completitud.db")
+        try:
+            self.conn = psycopg2.connect(
+                host=cfg.db_host,
+                port=cfg.db_port,
+                dbname=cfg.db_name,
+                user=cfg.db_user,
+                password=cfg.db_password,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+            )
+        except psycopg2.OperationalError as exc:
+            self.log.error(
+                "No se pudo conectar a PostgreSQL %s@%s:%s/%s: %s",
+                cfg.db_user,
+                cfg.db_host,
+                cfg.db_port,
+                cfg.db_name,
+                exc,
+            )
+            raise
+        self.conn.autocommit = False
 
     def close(self) -> None:
         self.conn.close()
@@ -1212,28 +1223,33 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     log = logging.getLogger("completitud")
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-    with Database(cfg) as db:
-        inspector = SchemaInspector(db, cfg)
-        inspector.report()
-        assets = AssetResolver(db, cfg)
-        assets.load()
+    try:
+        with Database(cfg) as db:
+            inspector = SchemaInspector(db, cfg)
+            inspector.report()
+            assets = AssetResolver(db, cfg)
+            assets.load()
 
-        analyzer = TimeseriesAnalyzer(db, cfg, assets, max_assets=args.max_activos)
-        analysis = analyzer.run()
+            analyzer = TimeseriesAnalyzer(db, cfg, assets, max_assets=args.max_activos)
+            analysis = analyzer.run()
 
-        save_analysis(cfg, analysis)
-        stats = summarise_statistics(analysis)
-        print_summary(stats)
+            save_analysis(cfg, analysis)
+            stats = summarise_statistics(analysis)
+            print_summary(stats)
 
-        if not args.sin_relleno:
-            refiller = Refiller(db, cfg, assets)
-            refill_actions = refiller.refill(analysis)
-        else:
-            refill_actions = {}
-            log.info("Modo sin relleno activado, no se completan huecos")
+            if not args.sin_relleno:
+                refiller = Refiller(db, cfg, assets)
+                refill_actions = refiller.refill(analysis)
+            else:
+                refill_actions = {}
+                log.info("Modo sin relleno activado, no se completan huecos")
 
-        audit = AuditTrail(cfg)
-        audit.persist(analysis, refill_actions)
+            audit = AuditTrail(cfg)
+            audit.persist(analysis, refill_actions)
+    except psycopg2.OperationalError as exc:
+        log.error("Conexión a la base de datos fallida: %s", exc)
+        log.error("Revise credenciales y disponibilidad del servidor")
+        return
 
     log.info("Proceso completado")
 

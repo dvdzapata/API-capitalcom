@@ -2,7 +2,8 @@
 
 El script se conecta a una base de datos PostgreSQL (credenciales en `.env`) y
 extrae cotizaciones minuto a minuto de la tabla `cotizaciones_intradia_cfd`
-filtrando por `symbol=US100` y `asset_id=97`. Cuando la configuración de
+filtrando por `symbol=US100`, `asset_id=97`, `intervalo='1min'` y usando la
+columna `fecha` como marca temporal. Cuando la configuración de
 PostgreSQL no está disponible, puede seguir recurriendo a la API de Capital.com
 como respaldo. Para cada día de la semana obtiene las últimas 50 sesiones
 (00:00 a 00:00 UTC del día siguiente), calcula la media minuto a minuto y
@@ -91,7 +92,9 @@ class PostgresIntradayConfig:
     table: str = "cotizaciones_intradia_cfd"
     symbol_column: str = "symbol"
     asset_id_column: str = "asset_id"
-    timestamp_column: str = "timestamp"
+    timestamp_column: str = "fecha"
+    interval_column: str = "intervalo"
+    interval_value: str = "1min"
     price_column: Optional[str] = None
     price_candidates: List[str] = field(
         default_factory=lambda: ["close", "mid_price", "price", "last", "last_price"]
@@ -470,6 +473,8 @@ class PostgresIntradaySource:
             self.config.symbol_column,
             self.config.asset_id_column,
         }
+        if self.config.interval_column:
+            required.add(self.config.interval_column)
         missing = sorted(col for col in required if col not in columns)
         if missing:
             raise RuntimeError(
@@ -491,6 +496,26 @@ class PostgresIntradaySource:
         self.logger.info(
             "Columna de precio seleccionada: %s", self._resolved_price_column
         )
+        interval_param = self._interval_param()
+        if interval_param is not None and self.config.interval_column:
+            self.logger.info(
+                "Filtro de intervalo aplicado: %s = %s",
+                self.config.interval_column,
+                interval_param,
+            )
+
+    def _interval_param(self) -> Optional[str]:
+        if self.config.interval_column and self.config.interval_value:
+            return self.config.interval_value
+        return None
+
+    def _build_interval_filter_sql(self) -> "sql.SQL":
+        assert sql is not None
+        if self.config.interval_column and self.config.interval_value:
+            return sql.SQL("AND {interval_col} = %s").format(
+                interval_col=sql.Identifier(self.config.interval_column)
+            )
+        return sql.SQL("")
 
     def session_starts_for_weekday(self, weekday: int, limit: int) -> List[datetime]:
         conn = self._ensure_connection()
@@ -503,6 +528,7 @@ class PostgresIntradaySource:
             WHERE {symbol_col} = %s
               AND {asset_id_col} = %s
               AND EXTRACT(ISODOW FROM {ts_col}) = %s
+              {interval_filter}
             GROUP BY 1
             ORDER BY 1 DESC
             LIMIT %s
@@ -512,13 +538,21 @@ class PostgresIntradaySource:
             table=self._table_identifier(),
             symbol_col=sql.Identifier(self.config.symbol_column),
             asset_id_col=sql.Identifier(self.config.asset_id_column),
+            interval_filter=self._build_interval_filter_sql(),
         )
+        interval_param = self._interval_param()
         params = (
             self.config.symbol,
             self.config.asset_id,
             weekday + 1,
+            *(
+                (interval_param,)
+                if interval_param is not None
+                else ()
+            ),
             effective_limit,
         )
+        params = tuple(params)
         with conn.cursor() as cur:
             cur.execute(query, params)
             rows = cur.fetchall()
@@ -550,6 +584,7 @@ class PostgresIntradaySource:
               AND {asset_id_col} = %s
               AND {ts_col} >= %s
               AND {ts_col} < %s
+              {interval_filter}
             ORDER BY {ts_col} ASC
             """
         ).format(
@@ -558,13 +593,21 @@ class PostgresIntradaySource:
             table=self._table_identifier(),
             symbol_col=sql.Identifier(self.config.symbol_column),
             asset_id_col=sql.Identifier(self.config.asset_id_column),
+            interval_filter=self._build_interval_filter_sql(),
         )
+        interval_param = self._interval_param()
         params = (
             self.config.symbol,
             self.config.asset_id,
             start_utc,
             end_utc,
+            *(
+                (interval_param,)
+                if interval_param is not None
+                else ()
+            ),
         )
+        params = tuple(params)
         with conn.cursor(**cursor_kwargs) as cur:  # type: ignore[arg-type]
             cur.execute(query, params)
             rows = cur.fetchall()
@@ -634,7 +677,9 @@ def load_postgres_intraday_config(logger: logging.Logger) -> Optional[PostgresIn
     table = os.getenv("POSTGRES_INTRADAY_TABLE", "cotizaciones_intradia_cfd").strip() or "cotizaciones_intradia_cfd"
     symbol_column = os.getenv("POSTGRES_SYMBOL_COLUMN", "symbol").strip() or "symbol"
     asset_id_column = os.getenv("POSTGRES_ASSET_ID_COLUMN", "asset_id").strip() or "asset_id"
-    timestamp_column = os.getenv("POSTGRES_TIMESTAMP_COLUMN", "timestamp").strip() or "timestamp"
+    timestamp_column = os.getenv("POSTGRES_TIMESTAMP_COLUMN", "fecha").strip() or "fecha"
+    interval_column = os.getenv("POSTGRES_INTERVAL_COLUMN", "intervalo").strip()
+    interval_value = os.getenv("POSTGRES_INTERVAL_VALUE", "1min").strip()
     price_column = os.getenv("POSTGRES_PRICE_COLUMN")
     price_candidates_env = os.getenv("POSTGRES_PRICE_CANDIDATES")
     price_candidates = (
@@ -666,6 +711,8 @@ def load_postgres_intraday_config(logger: logging.Logger) -> Optional[PostgresIn
         symbol_column=symbol_column,
         asset_id_column=asset_id_column,
         timestamp_column=timestamp_column,
+        interval_column=interval_column,
+        interval_value=interval_value,
         price_column=price_column.strip() if price_column and price_column.strip() else None,
         connect_timeout=connect_timeout,
         oversample_multiplier=oversample_multiplier,

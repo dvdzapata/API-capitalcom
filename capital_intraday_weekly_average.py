@@ -484,6 +484,11 @@ def compute_average_intraday(
     return averaged
 
 
+def _minute_to_hhmm(minute: int) -> str:
+    hours, minutes = divmod(int(minute), 60)
+    return f"{hours:02d}:{minutes:02d}"
+
+
 def plot_weekday_profiles(profiles: Dict[int, pd.DataFrame], output_path: Path) -> None:
     import matplotlib.pyplot as plt
 
@@ -552,9 +557,31 @@ def main() -> None:
             profile = compute_average_intraday(client, epic, weekday)
             valid_points = profile["sessions_used"]
             coverage = (valid_points >= 1).sum()
+            total_points = profile.shape[0]
+            coverage_pct = (coverage / total_points * 100.0) if total_points else 0.0
             logger.info(
-                "Día %s: puntos con datos %s/%s", weekday, coverage, profile.shape[0]
+                "Día %s: puntos con datos %s/%s (%.1f%%)",
+                weekday,
+                coverage,
+                total_points,
+                coverage_pct,
             )
+            if coverage == 0:
+                logger.warning(
+                    "Día %s sin minutos válidos: el mercado estuvo cerrado en esa ventana UTC",
+                    weekday,
+                )
+            elif coverage_pct < 50.0:
+                valid_minutes = profile.loc[valid_points >= 1, "minute"].astype(int)
+                first_minute = valid_minutes.min()
+                last_minute = valid_minutes.max()
+                logger.warning(
+                    "Cobertura limitada el día %s: datos entre %s y %s UTC."
+                    " Posible sesión parcial o cierre de mercado.",
+                    weekday,
+                    _minute_to_hhmm(first_minute),
+                    _minute_to_hhmm(last_minute),
+                )
             profiles[weekday] = profile
         except CapitalAPIError as exc:
             logger.warning("No se pudo calcular el día %s: %s", weekday, exc)

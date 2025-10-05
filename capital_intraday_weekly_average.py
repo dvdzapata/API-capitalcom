@@ -72,6 +72,7 @@ class CapitalClient:
         request_timeout: int = 30,
         max_requests_per_minute: int = 50,
         cache_dir: Path | None = None,
+        page_size: int = 1000,
     ) -> None:
         self.credentials = credentials
         self.logger = logger
@@ -92,6 +93,9 @@ class CapitalClient:
         self.cache_dir = cache_dir
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+        if page_size <= 0:
+            raise ValueError("page_size debe ser positivo")
+        self.page_size = min(page_size, 1000)
 
     def authenticate(self) -> None:
         payload = {"identifier": self.credentials.email, "password": self.credentials.password}
@@ -197,48 +201,70 @@ class CapitalClient:
         end: datetime,
         resolution: str,
     ) -> List[Dict[str, object]]:
-        key = f"prices_{epic}_{start:%Y%m%dT%H%M%S}_{end:%Y%m%dT%H%M%S}_{resolution}"
+        start_utc = start.astimezone(UTC) if start.tzinfo else start.replace(tzinfo=UTC)
+        end_utc = end.astimezone(UTC) if end.tzinfo else end.replace(tzinfo=UTC)
+        key = f"prices_{epic}_{start_utc:%Y%m%dT%H%M%S}_{end_utc:%Y%m%dT%H%M%S}_{resolution}"
         cached = self._read_cache(key)
         if cached:
             prices = cached.get("prices") if isinstance(cached, dict) else None
             if isinstance(prices, list):
                 return [item for item in prices if isinstance(item, dict)]
 
-        params = {
-            "resolution": resolution,
-            "from": start.strftime("%Y-%m-%dT%H:%M:%S"),
-            "to": end.strftime("%Y-%m-%dT%H:%M:%S"),
-            "pageSize": 2000,
-        }
-
+        collected: List[Dict[str, object]] = []
         for attempt in range(1, 4):
             try:
-                self._respect_rate_limit()
-                resp = self.session.get(
-                    f"{self.BASE_URL}/prices/{epic}",
-                    params=params,
-                    timeout=self.request_timeout,
-                )
-                self._last_request_ts = time.monotonic()
-                if resp.status_code != 200:
-                    error_payload: Dict[str, object] = {}
-                    try:
-                        error_payload = resp.json()
-                    except ValueError:  # pragma: no cover - respuesta no JSON
-                        error_payload = {}
-                    error_code = str(error_payload.get("errorCode", "")).lower()
-                    if resp.status_code == 400 and error_code == "error.invalid.max.daterange":
-                        raise CapitalDateRangeTooLarge(
-                            f"Rango {start.isoformat()} - {end.isoformat()} demasiado amplio"
-                        )
-                    raise CapitalAPIError(
-                        f"Capital.com devolvió {resp.status_code}: {resp.text[:200]}"
+                page_number = 1
+                collected.clear()
+                while True:
+                    params = {
+                        "resolution": resolution,
+                        "from": start_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "to": end_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "pageSize": self.page_size,
+                        "pageNumber": page_number,
+                    }
+                    self._respect_rate_limit()
+                    resp = self.session.get(
+                        f"{self.BASE_URL}/prices/{epic}",
+                        params=params,
+                        timeout=self.request_timeout,
                     )
-                payload = resp.json()
-                prices = payload.get("prices", []) if isinstance(payload, dict) else []
-                records = [item for item in prices if isinstance(item, dict)] if isinstance(prices, list) else []
-                self._write_cache(key, {"prices": records})
-                return records
+                    self._last_request_ts = time.monotonic()
+                    if resp.status_code != 200:
+                        error_payload: Dict[str, object] = {}
+                        try:
+                            error_payload = resp.json()
+                        except ValueError:  # pragma: no cover - respuesta no JSON
+                            error_payload = {}
+                        error_code = str(error_payload.get("errorCode", "")).lower()
+                        if resp.status_code == 400 and error_code == "error.invalid.max.daterange":
+                            raise CapitalDateRangeTooLarge(
+                                f"Rango {start.isoformat()} - {end.isoformat()} demasiado amplio"
+                            )
+                        raise CapitalAPIError(
+                            f"Capital.com devolvió {resp.status_code}: {resp.text[:200]}"
+                        )
+                    payload = resp.json()
+                    prices = payload.get("prices", []) if isinstance(payload, dict) else []
+                    page_records = (
+                        [item for item in prices if isinstance(item, dict)]
+                        if isinstance(prices, list)
+                        else []
+                    )
+                    collected.extend(page_records)
+                    self.logger.debug(
+                        "Descargada página %s (%s registros) para %s %s-%s",
+                        page_number,
+                        len(page_records),
+                        epic,
+                        start_utc.isoformat(),
+                        end_utc.isoformat(),
+                    )
+                    if len(page_records) < self.page_size:
+                        break
+                    page_number += 1
+                self._write_cache(key, {"prices": collected})
+                return list(collected)
             except CapitalDateRangeTooLarge:
                 raise
             except Exception as exc:  # pragma: no cover - reintentos

@@ -58,6 +58,10 @@ class CapitalAPIError(RuntimeError):
     """Errores de la API de Capital.com."""
 
 
+class CapitalDateRangeTooLarge(CapitalAPIError):
+    """Se solicitó un rango temporal superior al permitido por la API."""
+
+
 class CapitalClient:
     BASE_URL = "https://api-capital.backend-capital.com/api/v1"
 
@@ -179,16 +183,20 @@ class CapitalClient:
         self._write_cache(key, {"markets": markets})
         return markets
 
-    def fetch_prices(
+    def _min_span_for_resolution(self, resolution: str) -> timedelta:
+        if resolution.startswith("MINUTE"):
+            return timedelta(minutes=1)
+        if resolution.startswith("HOUR"):
+            return timedelta(hours=1)
+        return timedelta(minutes=1)
+
+    def _fetch_prices_chunk(
         self,
         epic: str,
         start: datetime,
         end: datetime,
-        resolution: str = "MINUTE",
+        resolution: str,
     ) -> List[Dict[str, object]]:
-        if not self.cst or not self.xst:
-            raise CapitalAPIError("Cliente no autenticado")
-
         key = f"prices_{epic}_{start:%Y%m%dT%H%M%S}_{end:%Y%m%dT%H%M%S}_{resolution}"
         cached = self._read_cache(key)
         if cached:
@@ -203,7 +211,6 @@ class CapitalClient:
             "pageSize": 2000,
         }
 
-        records: List[Dict[str, object]] = []
         for attempt in range(1, 4):
             try:
                 self._respect_rate_limit()
@@ -214,26 +221,95 @@ class CapitalClient:
                 )
                 self._last_request_ts = time.monotonic()
                 if resp.status_code != 200:
+                    error_payload: Dict[str, object] = {}
+                    try:
+                        error_payload = resp.json()
+                    except ValueError:  # pragma: no cover - respuesta no JSON
+                        error_payload = {}
+                    error_code = str(error_payload.get("errorCode", "")).lower()
+                    if resp.status_code == 400 and error_code == "error.invalid.max.daterange":
+                        raise CapitalDateRangeTooLarge(
+                            f"Rango {start.isoformat()} - {end.isoformat()} demasiado amplio"
+                        )
                     raise CapitalAPIError(
                         f"Capital.com devolvió {resp.status_code}: {resp.text[:200]}"
                     )
                 payload = resp.json()
                 prices = payload.get("prices", []) if isinstance(payload, dict) else []
-                if isinstance(prices, list):
-                    records = [item for item in prices if isinstance(item, dict)]
+                records = [item for item in prices if isinstance(item, dict)] if isinstance(prices, list) else []
                 self._write_cache(key, {"prices": records})
-                break
+                return records
+            except CapitalDateRangeTooLarge:
+                raise
             except Exception as exc:  # pragma: no cover - reintentos
                 self.logger.warning("Intento %s falló al pedir precios: %s", attempt, exc)
                 time.sleep(2 * attempt)
-        if not records:
+
+        raise CapitalAPIError(
+            f"Falló la descarga de precios tras múltiples intentos ({start.isoformat()} - {end.isoformat()})"
+        )
+
+    def fetch_prices(
+        self,
+        epic: str,
+        start: datetime,
+        end: datetime,
+        resolution: str = "MINUTE",
+    ) -> List[Dict[str, object]]:
+        if not self.cst or not self.xst:
+            raise CapitalAPIError("Cliente no autenticado")
+
+        pending: List[tuple[datetime, datetime]] = [(start, end)]
+        collected: List[Dict[str, object]] = []
+        min_span = self._min_span_for_resolution(resolution)
+
+        while pending:
+            chunk_start, chunk_end = pending.pop(0)
+            if chunk_start >= chunk_end:
+                continue
+            try:
+                chunk_records = self._fetch_prices_chunk(
+                    epic=epic,
+                    start=chunk_start,
+                    end=chunk_end,
+                    resolution=resolution,
+                )
+                collected.extend(chunk_records)
+            except CapitalDateRangeTooLarge:
+                duration = chunk_end - chunk_start
+                if duration <= min_span:
+                    self.logger.error(
+                        "Rango mínimo alcanzado sin datos para %s entre %s y %s",
+                        epic,
+                        chunk_start.isoformat(),
+                        chunk_end.isoformat(),
+                    )
+                    continue
+                midpoint = chunk_start + duration / 2
+                if midpoint <= chunk_start or midpoint >= chunk_end:
+                    midpoint = chunk_start + min_span
+                self.logger.debug(
+                    "Dividiendo petición %s en %s - %s y %s - %s",
+                    epic,
+                    chunk_start.isoformat(),
+                    midpoint.isoformat(),
+                    midpoint.isoformat(),
+                    chunk_end.isoformat(),
+                )
+                pending.insert(0, (midpoint, chunk_end))
+                pending.insert(0, (chunk_start, midpoint))
+                continue
+
+        if not collected:
             self.logger.warning(
                 "Sin datos devueltos para %s entre %s y %s",
                 epic,
                 start.isoformat(),
                 end.isoformat(),
             )
-        return records
+            return []
+
+        return collected
 
 
 def setup_logging(log_level: str = "INFO") -> logging.Logger:

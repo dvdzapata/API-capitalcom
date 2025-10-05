@@ -5,6 +5,10 @@ almacenadas en un archivo `.env`. Para cada día de la semana obtiene las
 últimas 50 sesiones (00:00 a 00:00 UTC del día siguiente), calcula la media
 minuto a minuto y genera un gráfico con el promedio intradía de cada día.
 
+Por defecto sólo se procesan los días hábiles (lunes a viernes). Esto puede
+ajustarse mediante la variable de entorno `CAPITAL_TRADING_WEEKDAYS` con una
+lista de índices de día separados por comas (0=lunes ... 6=domingo).
+
 Requisitos:
     pip install pandas requests matplotlib python-dotenv (opcional)
 """
@@ -534,8 +538,15 @@ def main() -> None:
     epic = os.getenv("CAPITAL_US100_EPIC")
     if not epic:
         epic = find_us100_epic(client)
+    trading_weekdays = tuple(int(x) for x in os.getenv("CAPITAL_TRADING_WEEKDAYS", "0,1,2,3,4").split(",") if x.strip().isdigit())
+    if not trading_weekdays:
+        trading_weekdays = (0, 1, 2, 3, 4)
     profiles: Dict[int, pd.DataFrame] = {}
     for weekday in range(7):
+        if weekday not in trading_weekdays:
+            logger.info("Se omite el día %s por no contar con cotizaciones de mercado", weekday)
+            profiles[weekday] = pd.DataFrame(columns=["minute", "average_close", "time", "sessions_used"])
+            continue
         try:
             logger.info("Procesando día %s", weekday)
             profile = compute_average_intraday(client, epic, weekday)

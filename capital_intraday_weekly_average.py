@@ -1,9 +1,12 @@
 """Genera promedios intradía por día de la semana para el índice US100.
 
-El script se autentica contra la API de Capital.com usando credenciales
-almacenadas en un archivo `.env`. Para cada día de la semana obtiene las
-últimas 50 sesiones (00:00 a 00:00 UTC del día siguiente), calcula la media
-minuto a minuto y genera un gráfico con el promedio intradía de cada día.
+El script se conecta a una base de datos PostgreSQL (credenciales en `.env`) y
+extrae cotizaciones minuto a minuto de la tabla `cotizaciones_intradia_cfd`
+filtrando por `symbol=US100` y `asset_id=97`. Cuando la configuración de
+PostgreSQL no está disponible, puede seguir recurriendo a la API de Capital.com
+como respaldo. Para cada día de la semana obtiene las últimas 50 sesiones
+(00:00 a 00:00 UTC del día siguiente), calcula la media minuto a minuto y
+genera un gráfico con el promedio intradía de cada día.
 
 Por defecto sólo se procesan los días hábiles (lunes a viernes). Esto puede
 ajustarse mediante la variable de entorno `CAPITAL_TRADING_WEEKDAYS` con una
@@ -18,13 +21,22 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 import pandas as pd
 import requests
+
+try:  # Conexión a PostgreSQL
+    import psycopg
+    from psycopg import sql
+    from psycopg.rows import dict_row
+except ModuleNotFoundError:  # pragma: no cover - dependencia opcional
+    psycopg = None  # type: ignore
+    sql = None  # type: ignore
+    dict_row = None  # type: ignore
 
 try:  # Carga opcional de .env
     from dotenv import load_dotenv
@@ -64,6 +76,28 @@ class CapitalAPIError(RuntimeError):
 
 class CapitalDateRangeTooLarge(CapitalAPIError):
     """Se solicitó un rango temporal superior al permitido por la API."""
+
+
+@dataclass
+class PostgresIntradayConfig:
+    host: str
+    port: int
+    database: str
+    user: str
+    password: str
+    symbol: str
+    asset_id: int
+    schema: str = "public"
+    table: str = "cotizaciones_intradia_cfd"
+    symbol_column: str = "symbol"
+    asset_id_column: str = "asset_id"
+    timestamp_column: str = "timestamp"
+    price_column: Optional[str] = None
+    price_candidates: List[str] = field(
+        default_factory=lambda: ["close", "mid_price", "price", "last", "last_price"]
+    )
+    connect_timeout: int = 10
+    oversample_multiplier: int = 3
 
 
 class CapitalClient:
@@ -342,6 +376,220 @@ class CapitalClient:
         return collected
 
 
+class PostgresIntradaySource:
+    """Cargador de cotizaciones intradía desde PostgreSQL."""
+
+    def __init__(self, config: PostgresIntradayConfig, logger: logging.Logger) -> None:
+        self.config = config
+        self.logger = logger
+        self._conn: Optional["psycopg.Connection"] = None
+        self._available_columns: Optional[set[str]] = None
+        self._resolved_price_column: Optional[str] = config.price_column
+
+    def __enter__(self) -> "PostgresIntradaySource":
+        self.connect()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc: Optional[BaseException],
+        traceback: Optional[object],
+    ) -> None:
+        self.close()
+
+    def connect(self) -> None:
+        if psycopg is None or sql is None:
+            raise RuntimeError(
+                "psycopg no está instalado; ejecute `pip install psycopg[binary]` para habilitar PostgreSQL"
+            )
+        if self._conn is not None:
+            return
+        self._conn = psycopg.connect(  # type: ignore[call-arg]
+            host=self.config.host,
+            port=self.config.port,
+            dbname=self.config.database,
+            user=self.config.user,
+            password=self.config.password,
+            connect_timeout=self.config.connect_timeout,
+        )
+        self._conn.autocommit = False
+        with self._conn.cursor() as cur:
+            cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+            cur.execute("SET TIME ZONE 'UTC'")
+        self.logger.info(
+            "Conexión PostgreSQL establecida en %s:%s/%s (tabla %s)",
+            self.config.host,
+            self.config.port,
+            self.config.database,
+            f"{self.config.schema}.{self.config.table}" if self.config.schema else self.config.table,
+        )
+        self._load_available_columns()
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            finally:
+                self._conn = None
+
+    def _ensure_connection(self) -> "psycopg.Connection":
+        if self._conn is None:
+            self.connect()
+        assert self._conn is not None
+        return self._conn
+
+    def _table_identifier(self) -> "sql.Composed":
+        assert sql is not None
+        if self.config.schema:
+            return sql.Identifier(self.config.schema, self.config.table)
+        return sql.Identifier(self.config.table)
+
+    def _load_available_columns(self) -> None:
+        conn = self._ensure_connection()
+        query: str
+        params: tuple[object, ...]
+        if self.config.schema:
+            query = (
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = %s"
+            )
+            params = (self.config.schema, self.config.table)
+        else:
+            query = "SELECT column_name FROM information_schema.columns WHERE table_name = %s"
+            params = (self.config.table,)
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            self._available_columns = {row[0] for row in cur.fetchall()}
+        self._resolve_columns()
+
+    def _resolve_columns(self) -> None:
+        columns = self._available_columns or set()
+        required = {
+            self.config.timestamp_column,
+            self.config.symbol_column,
+            self.config.asset_id_column,
+        }
+        missing = sorted(col for col in required if col not in columns)
+        if missing:
+            raise RuntimeError(
+                f"Faltan columnas requeridas {missing} en {self.config.schema}.{self.config.table}"
+            )
+        if self._resolved_price_column and self._resolved_price_column not in columns:
+            raise RuntimeError(
+                f"La columna de precio '{self._resolved_price_column}' no existe en la tabla"
+            )
+        if not self._resolved_price_column:
+            for candidate in self.config.price_candidates:
+                if candidate in columns:
+                    self._resolved_price_column = candidate
+                    break
+        if not self._resolved_price_column:
+            raise RuntimeError(
+                "No se encontró ninguna columna de precio válida; configure POSTGRES_PRICE_COLUMN"
+            )
+        self.logger.info(
+            "Columna de precio seleccionada: %s", self._resolved_price_column
+        )
+
+    def session_starts_for_weekday(self, weekday: int, limit: int) -> List[datetime]:
+        conn = self._ensure_connection()
+        assert sql is not None
+        effective_limit = max(limit * self.config.oversample_multiplier, limit)
+        query = sql.SQL(
+            """
+            SELECT date_trunc('day', {ts_col}) AS session_start
+            FROM {table}
+            WHERE {symbol_col} = %s
+              AND {asset_id_col} = %s
+              AND EXTRACT(ISODOW FROM {ts_col}) = %s
+            GROUP BY 1
+            ORDER BY 1 DESC
+            LIMIT %s
+            """
+        ).format(
+            ts_col=sql.Identifier(self.config.timestamp_column),
+            table=self._table_identifier(),
+            symbol_col=sql.Identifier(self.config.symbol_column),
+            asset_id_col=sql.Identifier(self.config.asset_id_column),
+        )
+        params = (
+            self.config.symbol,
+            self.config.asset_id,
+            weekday + 1,
+            effective_limit,
+        )
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+        session_starts: List[datetime] = []
+        for row in rows:
+            session_start = row[0]
+            if isinstance(session_start, datetime):
+                if session_start.tzinfo is None:
+                    session_start = session_start.replace(tzinfo=UTC)
+                else:
+                    session_start = session_start.astimezone(UTC)
+                session_starts.append(session_start)
+        return session_starts
+
+    def fetch_session_dataframe(self, session_start: datetime) -> Optional[pd.DataFrame]:
+        conn = self._ensure_connection()
+        assert sql is not None
+        if not self._resolved_price_column:
+            self._resolve_columns()
+        assert self._resolved_price_column is not None
+        start_utc = session_start.astimezone(UTC) if session_start.tzinfo else session_start.replace(tzinfo=UTC)
+        end_utc = start_utc + timedelta(days=1)
+        cursor_kwargs = {"row_factory": dict_row} if dict_row is not None else {}
+        query = sql.SQL(
+            """
+            SELECT {ts_col} AS ts, {price_col} AS price
+            FROM {table}
+            WHERE {symbol_col} = %s
+              AND {asset_id_col} = %s
+              AND {ts_col} >= %s
+              AND {ts_col} < %s
+            ORDER BY {ts_col} ASC
+            """
+        ).format(
+            ts_col=sql.Identifier(self.config.timestamp_column),
+            price_col=sql.Identifier(self._resolved_price_column),
+            table=self._table_identifier(),
+            symbol_col=sql.Identifier(self.config.symbol_column),
+            asset_id_col=sql.Identifier(self.config.asset_id_column),
+        )
+        params = (
+            self.config.symbol,
+            self.config.asset_id,
+            start_utc,
+            end_utc,
+        )
+        with conn.cursor(**cursor_kwargs) as cur:  # type: ignore[arg-type]
+            cur.execute(query, params)
+            rows = cur.fetchall()
+        if not rows:
+            self.logger.warning("Sesión sin datos válidos el %s", start_utc.date())
+            return None
+        if dict_row is not None:
+            df = pd.DataFrame(rows)
+        else:
+            df = pd.DataFrame(rows, columns=["ts", "price"])
+        if df.empty:
+            self.logger.warning("Sesión sin datos válidos el %s", start_utc.date())
+            return None
+        df = df.rename(columns={"ts": "timestamp", "price": "close"})
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df = df.dropna(subset=["timestamp", "close"])
+        if df.empty:
+            self.logger.warning(
+                "Sesión sin precios utilizables el %s (tras limpiar valores nulos)",
+                start_utc.date(),
+            )
+            return None
+        return _normalize_intraday_dataframe(df, start_utc, self.logger)
+
 def setup_logging(log_level: str = "INFO") -> logging.Logger:
     logging.basicConfig(
         level=getattr(logging, log_level.upper(), logging.INFO),
@@ -358,6 +606,73 @@ def get_credentials() -> CapitalCredentials:
     if not api_key or not email or not password:
         raise CapitalAPIError("Credenciales incompletas en .env (CAPITAL_API_KEY, CAPITAL_EMAIL, CAPITAL_PASSWORD)")
     return CapitalCredentials(api_key=api_key, email=email, password=password)
+
+
+def load_postgres_intraday_config(logger: logging.Logger) -> Optional[PostgresIntradayConfig]:
+    load_dotenv()
+    host = os.getenv("POSTGRES_HOST")
+    if not host:
+        return None
+    try:
+        port = int(os.getenv("POSTGRES_PORT", "5432"))
+    except ValueError as exc:  # pragma: no cover - configuración inválida
+        raise RuntimeError("POSTGRES_PORT debe ser numérico") from exc
+    database = os.getenv("POSTGRES_DB") or os.getenv("POSTGRES_DATABASE")
+    user = os.getenv("POSTGRES_USER")
+    password = os.getenv("POSTGRES_PASSWORD")
+    if not database or not user or not password:
+        raise RuntimeError(
+            "Config de PostgreSQL incompleta: se requieren POSTGRES_DB, POSTGRES_USER y POSTGRES_PASSWORD"
+        )
+    symbol = os.getenv("POSTGRES_US100_SYMBOL", "US100").strip() or "US100"
+    asset_id_raw = os.getenv("POSTGRES_US100_ASSET_ID", "97").strip() or "97"
+    try:
+        asset_id = int(asset_id_raw)
+    except ValueError as exc:  # pragma: no cover - configuración inválida
+        raise RuntimeError("POSTGRES_US100_ASSET_ID debe ser numérico") from exc
+    schema = os.getenv("POSTGRES_SCHEMA", "public").strip()
+    table = os.getenv("POSTGRES_INTRADAY_TABLE", "cotizaciones_intradia_cfd").strip() or "cotizaciones_intradia_cfd"
+    symbol_column = os.getenv("POSTGRES_SYMBOL_COLUMN", "symbol").strip() or "symbol"
+    asset_id_column = os.getenv("POSTGRES_ASSET_ID_COLUMN", "asset_id").strip() or "asset_id"
+    timestamp_column = os.getenv("POSTGRES_TIMESTAMP_COLUMN", "timestamp").strip() or "timestamp"
+    price_column = os.getenv("POSTGRES_PRICE_COLUMN")
+    price_candidates_env = os.getenv("POSTGRES_PRICE_CANDIDATES")
+    price_candidates = (
+        [col.strip() for col in price_candidates_env.split(",") if col.strip()]
+        if price_candidates_env
+        else None
+    )
+    try:
+        connect_timeout = int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "10"))
+    except ValueError as exc:  # pragma: no cover - configuración inválida
+        raise RuntimeError("POSTGRES_CONNECT_TIMEOUT debe ser numérico") from exc
+    try:
+        oversample_multiplier = int(os.getenv("POSTGRES_SESSION_OVERSAMPLE", "3"))
+    except ValueError as exc:  # pragma: no cover - configuración inválida
+        raise RuntimeError("POSTGRES_SESSION_OVERSAMPLE debe ser numérico") from exc
+    if oversample_multiplier < 1:
+        logger.warning("POSTGRES_SESSION_OVERSAMPLE < 1, se ajusta a 1")
+        oversample_multiplier = 1
+    config = PostgresIntradayConfig(
+        host=host,
+        port=port,
+        database=database,
+        user=user,
+        password=password,
+        symbol=symbol,
+        asset_id=asset_id,
+        schema=schema,
+        table=table,
+        symbol_column=symbol_column,
+        asset_id_column=asset_id_column,
+        timestamp_column=timestamp_column,
+        price_column=price_column.strip() if price_column and price_column.strip() else None,
+        connect_timeout=connect_timeout,
+        oversample_multiplier=oversample_multiplier,
+    )
+    if price_candidates:
+        config.price_candidates = price_candidates
+    return config
 
 
 def find_us100_epic(client: CapitalClient) -> str:
@@ -427,6 +742,42 @@ def daterange_for_weekday(target_weekday: int, sessions: int) -> List[datetime]:
     return dates
 
 
+def _normalize_intraday_dataframe(
+    df: pd.DataFrame, session_start: datetime, logger: logging.Logger
+) -> Optional[pd.DataFrame]:
+    if df.empty:
+        logger.warning("Sesión sin datos válidos el %s", session_start.date())
+        return None
+    session_start_utc = session_start.astimezone(UTC) if session_start.tzinfo else session_start.replace(
+        tzinfo=UTC
+    )
+    df = df.copy()
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df.dropna(subset=["timestamp", "close"])
+    if df.empty:
+        logger.warning(
+            "Sesión sin precios utilizables el %s (tras limpiar valores nulos)",
+            session_start_utc.date(),
+        )
+        return None
+    df["minute"] = (df["timestamp"] - session_start_utc).dt.total_seconds() / 60.0
+    df = df[(df["minute"] >= 0) & (df["minute"] <= 24 * 60)]
+    if df.empty:
+        logger.warning(
+            "Sesión fuera de rango temporal esperado el %s (sin minutos en ventana 00:00-24:00)",
+            session_start_utc.date(),
+        )
+        return None
+    df["minute"] = df["minute"].round().astype(int)
+    df = df.groupby("minute", as_index=False)["close"].mean()
+    logger.debug(
+        "Normalizada sesión %s con %s minutos válidos", session_start_utc.date(), len(df)
+    )
+    return df
+
+
 def build_intraday_dataframe(
     client: CapitalClient,
     epic: str,
@@ -441,33 +792,42 @@ def build_intraday_dataframe(
         client.logger.warning("Sesión sin datos válidos el %s", session_start.date())
         return None
     df = pd.DataFrame(normalized)
-    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    df["minute"] = (df["timestamp"] - session_start).dt.total_seconds() / 60.0
-    df = df[(df["minute"] >= 0) & (df["minute"] <= 24 * 60)]
-    df["minute"] = df["minute"].round().astype(int)
-    df = df.groupby("minute", as_index=False)["close"].mean()
-    return df
+    return _normalize_intraday_dataframe(df, session_start, client.logger)
 
 
 def compute_average_intraday(
-    client: CapitalClient,
-    epic: str,
     weekday: int,
-    sessions: int = 50,
-    resolution: str = "MINUTE",
+    sessions: int,
+    session_loader: Callable[[datetime], Optional[pd.DataFrame]],
+    logger: logging.Logger,
+    session_provider: Optional[Callable[[int, int], List[datetime]]] = None,
 ) -> pd.DataFrame:
-    session_starts = daterange_for_weekday(weekday, sessions)
-    if not session_starts:
+    if session_provider:
+        session_candidates = session_provider(weekday, sessions)
+    else:
+        session_candidates = daterange_for_weekday(weekday, sessions)
+    if not session_candidates:
         raise CapitalAPIError(f"No se encontraron fechas para el weekday {weekday}")
 
     frames: List[pd.DataFrame] = []
-    for start in session_starts:
-        df = build_intraday_dataframe(client, epic, start, resolution=resolution)
+    for start in session_candidates:
+        if len(frames) >= sessions:
+            break
+        df = session_loader(start)
         if df is None:
             continue
         frames.append(df)
+
     if not frames:
         raise CapitalAPIError(f"No se obtuvieron datos válidos para weekday {weekday}")
+
+    if len(frames) < sessions:
+        logger.warning(
+            "Sólo se pudieron utilizar %s de las %s sesiones requeridas para el día %s",
+            len(frames),
+            sessions,
+            weekday,
+        )
 
     master_index = pd.Index(range(0, 24 * 60), name="minute")
     aligned = []
@@ -487,6 +847,71 @@ def compute_average_intraday(
 def _minute_to_hhmm(minute: int) -> str:
     hours, minutes = divmod(int(minute), 60)
     return f"{hours:02d}:{minutes:02d}"
+
+
+def build_weekday_profiles(
+    logger: logging.Logger,
+    trading_weekdays: Sequence[int],
+    session_loader: Callable[[datetime], Optional[pd.DataFrame]],
+    session_provider: Optional[Callable[[int, int], List[datetime]]],
+    sessions: int,
+) -> Dict[int, pd.DataFrame]:
+    profiles: Dict[int, pd.DataFrame] = {}
+    for weekday in range(7):
+        if weekday not in trading_weekdays:
+            logger.info("Se omite el día %s por no contar con cotizaciones de mercado", weekday)
+            profiles[weekday] = pd.DataFrame(
+                columns=["minute", "average_close", "time", "sessions_used"]
+            )
+            continue
+        try:
+            logger.info("Procesando día %s", weekday)
+            profile = compute_average_intraday(
+                weekday=weekday,
+                sessions=sessions,
+                session_loader=session_loader,
+                logger=logger,
+                session_provider=session_provider,
+            )
+            valid_points = profile["sessions_used"]
+            coverage = (valid_points >= 1).sum()
+            total_points = profile.shape[0]
+            coverage_pct = (coverage / total_points * 100.0) if total_points else 0.0
+            logger.info(
+                "Día %s: puntos con datos %s/%s (%.1f%%)",
+                weekday,
+                coverage,
+                total_points,
+                coverage_pct,
+            )
+            if coverage == 0:
+                logger.warning(
+                    "Día %s sin minutos válidos: el mercado estuvo cerrado en esa ventana UTC",
+                    weekday,
+                )
+            elif coverage_pct < 50.0:
+                valid_minutes = profile.loc[valid_points >= 1, "minute"].astype(int)
+                first_minute = valid_minutes.min()
+                last_minute = valid_minutes.max()
+                logger.warning(
+                    "Cobertura limitada el día %s: datos entre %s y %s UTC."
+                    " Posible sesión parcial o cierre de mercado.",
+                    weekday,
+                    _minute_to_hhmm(first_minute),
+                    _minute_to_hhmm(last_minute),
+                )
+            profiles[weekday] = profile
+        except CapitalAPIError as exc:
+            logger.warning("No se pudo calcular el día %s: %s", weekday, exc)
+            profiles[weekday] = pd.DataFrame(
+                columns=["minute", "average_close", "time", "sessions_used"]
+            )
+        except Exception as exc:  # pragma: no cover - errores inesperados
+            logger.error("Fallo inesperado calculando el día %s: %s", weekday, exc)
+            profiles[weekday] = pd.DataFrame(
+                columns=["minute", "average_close", "time", "sessions_used"]
+            )
+    return profiles
 
 
 def plot_weekday_profiles(profiles: Dict[int, pd.DataFrame], output_path: Path) -> None:
@@ -530,62 +955,61 @@ def plot_weekday_profiles(profiles: Dict[int, pd.DataFrame], output_path: Path) 
 
 def main() -> None:
     logger = setup_logging()
-    credentials = get_credentials()
-    cache_dir = Path("cache_responses")
-    client = CapitalClient(
-        credentials=credentials,
-        logger=logger,
-        request_timeout=int(os.getenv("CAPITAL_REQUEST_TIMEOUT", "30")),
-        max_requests_per_minute=int(os.getenv("CAPITAL_MAX_REQUESTS_PER_MINUTE", "20")),
-        cache_dir=cache_dir,
+    try:
+        sessions = int(os.getenv("INTRADAY_AVG_SESSIONS", "50"))
+    except ValueError:
+        logger.warning("INTRADAY_AVG_SESSIONS inválido, se usará el valor por defecto (50)")
+        sessions = 50
+    if sessions <= 0:
+        logger.warning("INTRADAY_AVG_SESSIONS debe ser positivo, se ajusta a 50")
+        sessions = 50
+    trading_weekdays = tuple(
+        int(x)
+        for x in os.getenv("CAPITAL_TRADING_WEEKDAYS", "0,1,2,3,4").split(",")
+        if x.strip().isdigit()
     )
-    client.authenticate()
-    epic = os.getenv("CAPITAL_US100_EPIC")
-    if not epic:
-        epic = find_us100_epic(client)
-    trading_weekdays = tuple(int(x) for x in os.getenv("CAPITAL_TRADING_WEEKDAYS", "0,1,2,3,4").split(",") if x.strip().isdigit())
     if not trading_weekdays:
         trading_weekdays = (0, 1, 2, 3, 4)
-    profiles: Dict[int, pd.DataFrame] = {}
-    for weekday in range(7):
-        if weekday not in trading_weekdays:
-            logger.info("Se omite el día %s por no contar con cotizaciones de mercado", weekday)
-            profiles[weekday] = pd.DataFrame(columns=["minute", "average_close", "time", "sessions_used"])
-            continue
-        try:
-            logger.info("Procesando día %s", weekday)
-            profile = compute_average_intraday(client, epic, weekday)
-            valid_points = profile["sessions_used"]
-            coverage = (valid_points >= 1).sum()
-            total_points = profile.shape[0]
-            coverage_pct = (coverage / total_points * 100.0) if total_points else 0.0
-            logger.info(
-                "Día %s: puntos con datos %s/%s (%.1f%%)",
-                weekday,
-                coverage,
-                total_points,
-                coverage_pct,
+    postgres_config = load_postgres_intraday_config(logger)
+    profiles: Dict[int, pd.DataFrame]
+    if postgres_config:
+        logger.info(
+            "Usando origen PostgreSQL para US100 (symbol=%s, asset_id=%s)",
+            postgres_config.symbol,
+            postgres_config.asset_id,
+        )
+        with PostgresIntradaySource(postgres_config, logger) as source:
+            profiles = build_weekday_profiles(
+                logger=logger,
+                trading_weekdays=trading_weekdays,
+                session_loader=source.fetch_session_dataframe,
+                session_provider=source.session_starts_for_weekday,
+                sessions=sessions,
             )
-            if coverage == 0:
-                logger.warning(
-                    "Día %s sin minutos válidos: el mercado estuvo cerrado en esa ventana UTC",
-                    weekday,
-                )
-            elif coverage_pct < 50.0:
-                valid_minutes = profile.loc[valid_points >= 1, "minute"].astype(int)
-                first_minute = valid_minutes.min()
-                last_minute = valid_minutes.max()
-                logger.warning(
-                    "Cobertura limitada el día %s: datos entre %s y %s UTC."
-                    " Posible sesión parcial o cierre de mercado.",
-                    weekday,
-                    _minute_to_hhmm(first_minute),
-                    _minute_to_hhmm(last_minute),
-                )
-            profiles[weekday] = profile
-        except CapitalAPIError as exc:
-            logger.warning("No se pudo calcular el día %s: %s", weekday, exc)
-            profiles[weekday] = pd.DataFrame(columns=["minute", "average_close", "time", "sessions_used"])
+    else:
+        logger.info("No se configuró PostgreSQL; se usará la API de Capital.com")
+        credentials = get_credentials()
+        cache_dir = Path("cache_responses")
+        client = CapitalClient(
+            credentials=credentials,
+            logger=logger,
+            request_timeout=int(os.getenv("CAPITAL_REQUEST_TIMEOUT", "30")),
+            max_requests_per_minute=int(os.getenv("CAPITAL_MAX_REQUESTS_PER_MINUTE", "20")),
+            cache_dir=cache_dir,
+        )
+        client.authenticate()
+        epic = os.getenv("CAPITAL_US100_EPIC")
+        if not epic:
+            epic = find_us100_epic(client)
+        profiles = build_weekday_profiles(
+            logger=logger,
+            trading_weekdays=trading_weekdays,
+            session_loader=lambda start: build_intraday_dataframe(
+                client, epic, start, resolution="MINUTE"
+            ),
+            session_provider=None,
+            sessions=sessions,
+        )
     output_path = Path("outputs/us100_intradia_promedios.png")
     plot_weekday_profiles(profiles, output_path)
     logger.info("Gráfico generado en %s", output_path.resolve())
